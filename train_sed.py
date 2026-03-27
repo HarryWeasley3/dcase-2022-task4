@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import os
 import random
 import warnings
@@ -22,8 +23,55 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
 
-def resample_data_generate_durations(config_data, test_only=False, evaluation=False):
-    if not test_only:
+def _build_trainer_kwargs(
+    config, gpus, n_epochs, callbacks, logger, checkpoint_resume, flush_logs_every_n_steps
+):
+    trainer_signature = inspect.signature(pl.Trainer)
+    trainer_kwargs = {
+        "precision": config["training"]["precision"],
+        "max_epochs": n_epochs,
+        "callbacks": callbacks,
+        "accumulate_grad_batches": config["training"]["accumulate_batches"],
+        "logger": logger,
+        "gradient_clip_val": config["training"]["gradient_clip"],
+        "check_val_every_n_epoch": config["training"]["validation_interval"],
+        "num_sanity_val_steps": 0,
+    }
+
+    backend = config["training"].get("backend")
+    if "flush_logs_every_n_steps" in trainer_signature.parameters:
+        trainer_kwargs["flush_logs_every_n_steps"] = flush_logs_every_n_steps
+
+    if "gpus" in trainer_signature.parameters:
+        trainer_kwargs["gpus"] = gpus
+        trainer_kwargs["strategy"] = backend
+        trainer_kwargs["resume_from_checkpoint"] = checkpoint_resume
+    else:
+        if gpus == "0":
+            trainer_kwargs["accelerator"] = "cpu"
+            trainer_kwargs["devices"] = 1
+        else:
+            trainer_kwargs["accelerator"] = "gpu"
+            trainer_kwargs["devices"] = 1
+
+        # `dp` is not supported in Lightning 2.x and is unnecessary for single-device runs.
+        if backend not in (None, "dp"):
+            trainer_kwargs["strategy"] = backend
+
+    return trainer_kwargs
+
+
+def resample_data_generate_durations(
+    config_data, test_only=False, evaluation=False, synth_only=False
+):
+    computed = False
+    if evaluation:
+        dsets = ["eval_folder"]
+    elif synth_only:
+        dsets = ["synth_folder", "synth_val_folder"]
+        if test_only or config_data["test_folder"] != config_data["synth_val_folder"]:
+            dsets.append("test_folder")
+    elif not test_only:
         dsets = [
             "synth_folder",
             "synth_val_folder",
@@ -32,18 +80,24 @@ def resample_data_generate_durations(config_data, test_only=False, evaluation=Fa
             "unlabeled_folder",
             "test_folder",
         ]
-    elif test_only:
-        dsets = ["test_folder"]
     else:
-        dsets = ["eval_folder"]
+        dsets = ["test_folder"]
 
     for dset in dsets:
-        computed = resample_folder(
+        if not config_data.get(dset + "_44k") or not config_data.get(dset):
+            continue
+        computed = (
+            resample_folder(
             config_data[dset + "_44k"], config_data[dset], target_fs=config_data["fs"]
+            )
+            or computed
         )
 
     if not evaluation:
-        for base_set in ["synth_val", "test"]:
+        duration_sets = ["synth_val", "test"]
+        if synth_only and config_data["test_dur"] == config_data["synth_val_dur"]:
+            duration_sets = ["synth_val"]
+        for base_set in duration_sets:
             if not os.path.exists(config_data[base_set + "_dur"]) or computed:
                 generate_tsv_wav_durations(
                     config_data[base_set + "_folder"], config_data[base_set + "_dur"]
@@ -59,6 +113,7 @@ def single_run(
     test_state_dict=None,
     fast_dev_run=False,
     evaluation=False,
+    synth_only=False,
 ):
     """
     Running sound event detection baselin
@@ -114,7 +169,7 @@ def single_run(
             pad_to=config["data"]["audio_max_len"],
         )
 
-        if strong_real:
+        if strong_real and not synth_only:
             strong_df = pd.read_csv(config["data"]["strong_tsv"], sep="\t")
             strong_set = StronglyAnnotatedSet(
                 config["data"]["strong_folder"],
@@ -122,26 +177,6 @@ def single_run(
                 encoder,
                 pad_to=config["data"]["audio_max_len"],
             )
-
-        weak_df = pd.read_csv(config["data"]["weak_tsv"], sep="\t")
-        train_weak_df = weak_df.sample(
-            frac=config["training"]["weak_split"],
-            random_state=config["training"]["seed"],
-        )
-        valid_weak_df = weak_df.drop(train_weak_df.index).reset_index(drop=True)
-        train_weak_df = train_weak_df.reset_index(drop=True)
-        weak_set = WeakSet(
-            config["data"]["weak_folder"],
-            train_weak_df,
-            encoder,
-            pad_to=config["data"]["audio_max_len"],
-        )
-
-        unlabeled_set = UnlabeledSet(
-            config["data"]["unlabeled_folder"],
-            encoder,
-            pad_to=config["data"]["audio_max_len"],
-        )
 
         synth_df_val = pd.read_csv(config["data"]["synth_val_tsv"], sep="\t")
         synth_val = StronglyAnnotatedSet(
@@ -152,38 +187,74 @@ def single_run(
             pad_to=config["data"]["audio_max_len"],
         )
 
-        weak_val = WeakSet(
-            config["data"]["weak_folder"],
-            valid_weak_df,
-            encoder,
-            pad_to=config["data"]["audio_max_len"],
-            return_filename=True,
-        )
-
-        if strong_real:
-            strong_full_set = torch.utils.data.ConcatDataset([strong_set, synth_set])
-            tot_train_data = [strong_full_set, weak_set, unlabeled_set]
+        if synth_only:
+            train_dataset = synth_set
+            valid_dataset = synth_val
+            batch_sampler = None
+            batch_size = config["training"]["batch_size"]
+            if isinstance(batch_size, (list, tuple)):
+                batch_size = batch_size[0]
+            epoch_len = max(
+                1,
+                len(train_dataset)
+                // (batch_size * config["training"]["accumulate_batches"]),
+            )
         else:
-            tot_train_data = [synth_set, weak_set, unlabeled_set]
-        train_dataset = torch.utils.data.ConcatDataset(tot_train_data)
+            weak_df = pd.read_csv(config["data"]["weak_tsv"], sep="\t")
+            train_weak_df = weak_df.sample(
+                frac=config["training"]["weak_split"],
+                random_state=config["training"]["seed"],
+            )
+            valid_weak_df = weak_df.drop(train_weak_df.index).reset_index(drop=True)
+            train_weak_df = train_weak_df.reset_index(drop=True)
+            weak_set = WeakSet(
+                config["data"]["weak_folder"],
+                train_weak_df,
+                encoder,
+                pad_to=config["data"]["audio_max_len"],
+            )
 
-        batch_sizes = config["training"]["batch_size"]
-        samplers = [torch.utils.data.RandomSampler(x) for x in tot_train_data]
-        batch_sampler = ConcatDatasetBatchSampler(samplers, batch_sizes)
+            unlabeled_set = UnlabeledSet(
+                config["data"]["unlabeled_folder"],
+                encoder,
+                pad_to=config["data"]["audio_max_len"],
+            )
 
-        valid_dataset = torch.utils.data.ConcatDataset([synth_val, weak_val])
+            weak_val = WeakSet(
+                config["data"]["weak_folder"],
+                valid_weak_df,
+                encoder,
+                pad_to=config["data"]["audio_max_len"],
+                return_filename=True,
+            )
 
-        ##### training params and optimizers ############
-        epoch_len = min(
-            [
-                len(tot_train_data[indx])
-                // (
-                    config["training"]["batch_size"][indx]
-                    * config["training"]["accumulate_batches"]
-                )
-                for indx in range(len(tot_train_data))
-            ]
-        )
+            if strong_real:
+                strong_full_set = torch.utils.data.ConcatDataset([strong_set, synth_set])
+                tot_train_data = [strong_full_set, weak_set, unlabeled_set]
+            else:
+                tot_train_data = [synth_set, weak_set, unlabeled_set]
+            train_dataset = torch.utils.data.ConcatDataset(tot_train_data)
+
+            batch_sizes = config["training"]["batch_size"]
+            samplers = [torch.utils.data.RandomSampler(x) for x in tot_train_data]
+            batch_sampler = ConcatDatasetBatchSampler(samplers, batch_sizes)
+
+            valid_dataset = torch.utils.data.ConcatDataset([synth_val, weak_val])
+
+            ##### training params and optimizers ############
+            epoch_len = max(
+                1,
+                min(
+                    [
+                        len(tot_train_data[indx])
+                        // (
+                            config["training"]["batch_size"][indx]
+                            * config["training"]["accumulate_batches"]
+                        )
+                        for indx in range(len(tot_train_data))
+                    ]
+                ),
+            )
 
         opt = torch.optim.Adam(sed_student.parameters(), 1e-3, betas=(0.9, 0.999))
         exp_steps = config["training"]["n_epochs_warmup"] * epoch_len
@@ -254,28 +325,31 @@ def single_run(
     if len(gpus.split(",")) > 1:
         raise NotImplementedError("Multiple GPUs are currently not supported")
 
-    trainer = pl.Trainer(
-        precision=config["training"]["precision"],
-        max_epochs=n_epochs,
-        callbacks=callbacks,
-        gpus=gpus,
-        strategy=config["training"].get("backend"),
-        accumulate_grad_batches=config["training"]["accumulate_batches"],
-        logger=logger,
-        resume_from_checkpoint=checkpoint_resume,
-        gradient_clip_val=config["training"]["gradient_clip"],
-        check_val_every_n_epoch=config["training"]["validation_interval"],
-        num_sanity_val_steps=0,
-        log_every_n_steps=log_every_n_steps,
-        flush_logs_every_n_steps=flush_logs_every_n_steps,
-        limit_train_batches=limit_train_batches,
-        limit_val_batches=limit_val_batches,
-        limit_test_batches=limit_test_batches,
+    trainer_kwargs = _build_trainer_kwargs(
+        config,
+        gpus,
+        n_epochs,
+        callbacks,
+        logger,
+        checkpoint_resume,
+        flush_logs_every_n_steps,
     )
+    trainer_kwargs.update(
+        {
+            "log_every_n_steps": log_every_n_steps,
+            "limit_train_batches": limit_train_batches,
+            "limit_val_batches": limit_val_batches,
+            "limit_test_batches": limit_test_batches,
+        }
+    )
+    trainer = pl.Trainer(**trainer_kwargs)
 
     if test_state_dict is None:
         # start tracking energy consumption
-        trainer.fit(desed_training)
+        fit_kwargs = {}
+        if checkpoint_resume is not None and "gpus" not in inspect.signature(pl.Trainer).parameters:
+            fit_kwargs["ckpt_path"] = checkpoint_resume
+        trainer.fit(desed_training, **fit_kwargs)
         best_path = trainer.checkpoint_callback.best_model_path
         print(f"best model: {best_path}")
         test_state_dict = torch.load(best_path)["state_dict"]
@@ -328,11 +402,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_from_checkpoint", default=None, help="Evaluate the model specified"
     )
+    parser.add_argument(
+        "--synth_only",
+        action="store_true",
+        default=False,
+        help="Train with synthetic train/validation data only, without weak, unlabeled or strong real data.",
+    )
 
     args = parser.parse_args()
 
     with open(args.conf_file, "r") as f:
         configs = yaml.safe_load(f)
+
+    configs.setdefault("training", {})
+    configs["training"]["synth_only"] = args.synth_only or configs["training"].get(
+        "synth_only", False
+    )
 
     evaluation = False
     test_from_checkpoint = args.test_from_checkpoint
@@ -363,7 +448,13 @@ if __name__ == "__main__":
         pl.seed_everything(seed)
 
     test_only = test_from_checkpoint is not None
-    resample_data_generate_durations(configs["data"], test_only, evaluation)
+    synth_only = configs["training"]["synth_only"]
+    if synth_only and args.strong_real:
+        warnings.warn("--strong_real is ignored when --synth_only is enabled.")
+        args.strong_real = False
+    resample_data_generate_durations(
+        configs["data"], test_only, evaluation, synth_only=synth_only
+    )
     single_run(
         configs,
         args.log_dir,
@@ -373,4 +464,5 @@ if __name__ == "__main__":
         test_model_state_dict,
         args.fast_dev_run,
         evaluation,
+        synth_only,
     )

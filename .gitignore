@@ -1,0 +1,42 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 数据与特征 (极其重要，防止大文件提交)
+data/
+*.wav
+*.npy
+*.pt
+*.pth
+
+# PyTorch Lightning & 日志
+lightning_logs/
+wandb/
+*.ckpt
+*.log
+
+# IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
+
+# 虚拟环境
+venv/
+env/
+
+logs/
+ckpt/
+.vscode/
+baseline_result/
+
+# 日志与输出目录
+log/
+logs/
+lightning_logs/
+wandb/
+*.log
+
+
+runtime_data/
+exp/

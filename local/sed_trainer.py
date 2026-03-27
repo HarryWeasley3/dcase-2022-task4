@@ -18,6 +18,20 @@ from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 from .utils import batched_decode_preds, log_sedeval_metrics
 
 
+def _build_multilabel_f1(num_labels):
+    try:
+        return torchmetrics.classification.MultilabelF1Score(
+            num_labels=num_labels,
+            average="macro",
+        )
+    except AttributeError:
+        return torchmetrics.classification.f_beta.F1Score(
+            num_labels,
+            average="macro",
+            compute_on_step=False,
+        )
+
+
 class SEDTask4(pl.LightningModule):
     """Pytorch lightning module for the SED 2021 baseline
     Args:
@@ -73,6 +87,8 @@ class SEDTask4(pl.LightningModule):
         self.scheduler = scheduler
         self.fast_dev_run = fast_dev_run
         self.evaluation = evaluation
+        self.synth_only = self.hparams["training"].get("synth_only", False)
+        self.has_weak_validation = False
 
         if self.fast_dev_run:
             self.num_workers = 1
@@ -106,16 +122,12 @@ class SEDTask4(pl.LightningModule):
             raise NotImplementedError
 
         # for weak labels we simply compute f1 score
-        self.get_weak_student_f1_seg_macro = torchmetrics.classification.f_beta.F1Score(
-            len(self.encoder.labels),
-            average="macro",
-            compute_on_step=False,
+        self.get_weak_student_f1_seg_macro = _build_multilabel_f1(
+            len(self.encoder.labels)
         )
 
-        self.get_weak_teacher_f1_seg_macro = torchmetrics.classification.f_beta.F1Score(
-            len(self.encoder.labels),
-            average="macro",
-            compute_on_step=False,
+        self.get_weak_teacher_f1_seg_macro = _build_multilabel_f1(
+            len(self.encoder.labels)
         )
 
         self.scaler = self._init_scaler()
@@ -246,24 +258,32 @@ class SEDTask4(pl.LightningModule):
         """
 
         audio, labels, padded_indxs = batch
-        indx_synth, indx_weak, indx_unlabelled = self.hparams["training"]["batch_size"]
         features = self.mel_spec(audio)
 
         batch_num = features.shape[0]
-        # deriving masks for each dataset
-        strong_mask = torch.zeros(batch_num).to(features).bool()
-        weak_mask = torch.zeros(batch_num).to(features).bool()
-        strong_mask[:indx_synth] = 1
-        weak_mask[indx_synth : indx_weak + indx_synth] = 1
+        if self.synth_only:
+            strong_mask = torch.ones(batch_num).to(features).bool()
+            weak_mask = torch.zeros(batch_num).to(features).bool()
+            labels_weak = None
+        else:
+            indx_synth, indx_weak, indx_unlabelled = self.hparams["training"][
+                "batch_size"
+            ]
+            # deriving masks for each dataset
+            strong_mask = torch.zeros(batch_num).to(features).bool()
+            weak_mask = torch.zeros(batch_num).to(features).bool()
+            strong_mask[:indx_synth] = 1
+            weak_mask[indx_synth : indx_weak + indx_synth] = 1
 
-        # deriving weak labels
-        labels_weak = (torch.sum(labels[weak_mask], -1) > 0).float()
+            # deriving weak labels
+            labels_weak = (torch.sum(labels[weak_mask], -1) > 0).float()
 
         mixup_type = self.hparams["training"].get("mixup")
         if mixup_type is not None and 0.5 > random.random():
-            features[weak_mask], labels_weak = mixup(
-                features[weak_mask], labels_weak, mixup_label_type=mixup_type
-            )
+            if torch.any(weak_mask):
+                features[weak_mask], labels_weak = mixup(
+                    features[weak_mask], labels_weak, mixup_label_type=mixup_type
+                )
             features[strong_mask], labels[strong_mask] = mixup(
                 features[strong_mask], labels[strong_mask], mixup_label_type=mixup_type
             )
@@ -277,10 +297,15 @@ class SEDTask4(pl.LightningModule):
         loss_strong = self.supervised_loss(
             strong_preds_student[strong_mask], labels[strong_mask]
         )
-        # supervised loss on weakly labelled
-        loss_weak = self.supervised_loss(weak_preds_student[weak_mask], labels_weak)
-        # total supervised loss
-        tot_loss_supervised = loss_strong + loss_weak
+        if torch.any(weak_mask):
+            # supervised loss on weakly labelled
+            loss_weak = self.supervised_loss(
+                weak_preds_student[weak_mask], labels_weak
+            )
+            tot_loss_supervised = loss_strong + loss_weak
+        else:
+            loss_weak = torch.zeros((), device=features.device)
+            tot_loss_supervised = loss_strong
 
         with torch.no_grad():
             strong_preds_teacher, weak_preds_teacher = self.detect(
@@ -290,9 +315,12 @@ class SEDTask4(pl.LightningModule):
                 strong_preds_teacher[strong_mask], labels[strong_mask]
             )
 
-            loss_weak_teacher = self.supervised_loss(
-                weak_preds_teacher[weak_mask], labels_weak
-            )
+            if torch.any(weak_mask):
+                loss_weak_teacher = self.supervised_loss(
+                    weak_preds_teacher[weak_mask], labels_weak
+                )
+            else:
+                loss_weak_teacher = torch.zeros((), device=features.device)
         # we apply consistency between the predictions, use the scheduler for learning rate (to be changed ?)
         weight = (
             self.hparams["training"]["const_max"]
@@ -374,6 +402,7 @@ class SEDTask4(pl.LightningModule):
         )
 
         if torch.any(mask_weak):
+            self.has_weak_validation = True
             labels_weak = (torch.sum(labels[mask_weak], -1) >= 1).float()
 
             loss_weak_student = self.supervised_loss(
@@ -419,9 +448,10 @@ class SEDTask4(pl.LightningModule):
             )
 
             for th in self.val_buffer_student_synth.keys():
-                self.val_buffer_student_synth[th] = self.val_buffer_student_synth[
-                    th
-                ].append(decoded_student_strong[th], ignore_index=True)
+                self.val_buffer_student_synth[th] = pd.concat(
+                    [self.val_buffer_student_synth[th], decoded_student_strong[th]],
+                    ignore_index=True,
+                )
 
             decoded_teacher_strong = batched_decode_preds(
                 strong_preds_teacher[mask_synth],
@@ -431,24 +461,26 @@ class SEDTask4(pl.LightningModule):
                 thresholds=list(self.val_buffer_teacher_synth.keys()),
             )
             for th in self.val_buffer_teacher_synth.keys():
-                self.val_buffer_teacher_synth[th] = self.val_buffer_teacher_synth[
-                    th
-                ].append(decoded_teacher_strong[th], ignore_index=True)
+                self.val_buffer_teacher_synth[th] = pd.concat(
+                    [self.val_buffer_teacher_synth[th], decoded_teacher_strong[th]],
+                    ignore_index=True,
+                )
 
         return
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         """Fonction applied at the end of all the validation steps of the epoch.
-
-        Args:
-            outputs: torch.Tensor, the concatenation of everything returned by validation_step.
 
         Returns:
             torch.Tensor, the objective metric to be used to choose the best model from for example.
         """
 
-        weak_student_f1_macro = self.get_weak_student_f1_seg_macro.compute()
-        weak_teacher_f1_macro = self.get_weak_teacher_f1_seg_macro.compute()
+        if self.has_weak_validation:
+            weak_student_f1_macro = self.get_weak_student_f1_seg_macro.compute()
+            weak_teacher_f1_macro = self.get_weak_teacher_f1_seg_macro.compute()
+        else:
+            weak_student_f1_macro = torch.tensor(0.0, device=self.device)
+            weak_teacher_f1_macro = torch.tensor(0.0, device=self.device)
 
         # synth dataset
         intersection_f1_macro_student = compute_per_intersection_macro_f1(
@@ -485,7 +517,12 @@ class SEDTask4(pl.LightningModule):
                 f"obj_metric_synth_type: {obj_metric_synth_type} not implemented."
             )
 
-        obj_metric = torch.tensor(weak_student_f1_macro.item() + synth_metric)
+        if self.synth_only or not self.has_weak_validation:
+            obj_metric = torch.tensor(synth_metric, device=self.device)
+        else:
+            obj_metric = torch.tensor(
+                weak_student_f1_macro.item() + synth_metric, device=self.device
+            )
 
         self.log("val/obj_metric", obj_metric, prog_bar=True)
         self.log("val/weak/student/macro_F1", weak_student_f1_macro)
@@ -509,6 +546,7 @@ class SEDTask4(pl.LightningModule):
 
         self.get_weak_student_f1_seg_macro.reset()
         self.get_weak_teacher_f1_seg_macro.reset()
+        self.has_weak_validation = False
 
         return obj_metric
 
@@ -551,9 +589,10 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_student.keys():
-            self.test_psds_buffer_student[th] = self.test_psds_buffer_student[
-                th
-            ].append(decoded_student_strong[th], ignore_index=True)
+            self.test_psds_buffer_student[th] = pd.concat(
+                [self.test_psds_buffer_student[th], decoded_student_strong[th]],
+                ignore_index=True,
+            )
 
         decoded_teacher_strong = batched_decode_preds(
             strong_preds_teacher,
@@ -564,9 +603,10 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_teacher.keys():
-            self.test_psds_buffer_teacher[th] = self.test_psds_buffer_teacher[
-                th
-            ].append(decoded_teacher_strong[th], ignore_index=True)
+            self.test_psds_buffer_teacher[th] = pd.concat(
+                [self.test_psds_buffer_teacher[th], decoded_teacher_strong[th]],
+                ignore_index=True,
+            )
 
         # compute f1 score
         decoded_student_strong = batched_decode_preds(
@@ -577,8 +617,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_student_05_buffer = self.decoded_student_05_buffer.append(
-            decoded_student_strong[0.5]
+        self.decoded_student_05_buffer = pd.concat(
+            [self.decoded_student_05_buffer, decoded_student_strong[0.5]],
+            ignore_index=True,
         )
 
         decoded_teacher_strong = batched_decode_preds(
@@ -589,8 +630,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_teacher_05_buffer = self.decoded_teacher_05_buffer.append(
-            decoded_teacher_strong[0.5]
+        self.decoded_teacher_05_buffer = pd.concat(
+            [self.decoded_teacher_05_buffer, decoded_teacher_strong[0.5]],
+            ignore_index=True,
         )
 
     def on_test_epoch_end(self):
@@ -755,12 +797,27 @@ class SEDTask4(pl.LightningModule):
     def configure_optimizers(self):
         return [self.opt], [self.scheduler]
 
+    def lr_scheduler_step(self, scheduler, metric):
+        scheduler.step()
+
     def train_dataloader(self):
-        self.train_loader = torch.utils.data.DataLoader(
-            self.train_data,
-            batch_sampler=self.train_sampler,
-            num_workers=self.num_workers,
-        )
+        if self.train_sampler is None:
+            batch_size = self.hparams["training"]["batch_size"]
+            if isinstance(batch_size, (list, tuple)):
+                batch_size = batch_size[0]
+            self.train_loader = torch.utils.data.DataLoader(
+                self.train_data,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=False,
+                num_workers=self.num_workers,
+            )
+        else:
+            self.train_loader = torch.utils.data.DataLoader(
+                self.train_data,
+                batch_sampler=self.train_sampler,
+                num_workers=self.num_workers,
+            )
 
         return self.train_loader
 

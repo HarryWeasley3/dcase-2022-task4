@@ -3,9 +3,9 @@ import glob
 import os
 from pathlib import Path
 
-import librosa
 import torch
 import torchaudio
+import torchaudio.functional as F
 import tqdm
 
 parser = argparse.ArgumentParser("Resample a folder recursively")
@@ -32,14 +32,9 @@ def resample(audio, orig_fs, target_fs):
     Returns:
         Tensor: audio resampled
     """
-    out = []
-    for c in range(audio.shape[0]):
-        tmp = audio[c].detach().cpu().numpy()
-        if target_fs != orig_fs:
-            tmp = librosa.resample(tmp, orig_fs, target_fs)
-        out.append(torch.from_numpy(tmp))
-    out = torch.stack(out)
-    return out
+    if target_fs == orig_fs:
+        return audio
+    return F.resample(audio, orig_freq=orig_fs, new_freq=target_fs)
 
 
 def resample_folder(in_dir, out_dir, target_fs=16000, regex="*.wav"):

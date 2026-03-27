@@ -48,7 +48,9 @@ def batched_decode_preds(
             pred = encoder.decode_strong(pred)
             pred = pd.DataFrame(pred, columns=["event_label", "onset", "offset"])
             pred["filename"] = Path(filenames[j]).stem + ".wav"
-            prediction_dfs[c_th] = prediction_dfs[c_th].append(pred, ignore_index=True)
+            prediction_dfs[c_th] = pd.concat(
+                [prediction_dfs[c_th], pred], ignore_index=True
+            )
 
     return prediction_dfs
 
@@ -179,6 +181,7 @@ def generate_tsv_wav_durations(audio_dir, out_tsv):
         meta_list.append([os.path.basename(file), d])
     meta_df = pd.DataFrame(meta_list, columns=["filename", "duration"])
     if out_tsv is not None:
+        os.makedirs(Path(out_tsv).parent, exist_ok=True)
         meta_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.1f")
 
     return meta_df

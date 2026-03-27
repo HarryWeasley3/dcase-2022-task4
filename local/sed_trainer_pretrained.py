@@ -468,9 +468,10 @@ class SEDTask4(pl.LightningModule):
             )
 
             for th in self.val_buffer_student_synth.keys():
-                self.val_buffer_student_synth[th] = self.val_buffer_student_synth[
-                    th
-                ].append(decoded_student_strong[th], ignore_index=True)
+                self.val_buffer_student_synth[th] = pd.concat(
+                    [self.val_buffer_student_synth[th], decoded_student_strong[th]],
+                    ignore_index=True,
+                )
 
             decoded_teacher_strong = batched_decode_preds(
                 strong_preds_teacher[mask_synth],
@@ -480,9 +481,10 @@ class SEDTask4(pl.LightningModule):
                 thresholds=list(self.val_buffer_teacher_synth.keys()),
             )
             for th in self.val_buffer_teacher_synth.keys():
-                self.val_buffer_teacher_synth[th] = self.val_buffer_teacher_synth[
-                    th
-                ].append(decoded_teacher_strong[th], ignore_index=True)
+                self.val_buffer_teacher_synth[th] = pd.concat(
+                    [self.val_buffer_teacher_synth[th], decoded_teacher_strong[th]],
+                    ignore_index=True,
+                )
 
         return
 
@@ -622,9 +624,10 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_student.keys():
-            self.test_psds_buffer_student[th] = self.test_psds_buffer_student[
-                th
-            ].append(decoded_student_strong[th], ignore_index=True)
+            self.test_psds_buffer_student[th] = pd.concat(
+                [self.test_psds_buffer_student[th], decoded_student_strong[th]],
+                ignore_index=True,
+            )
 
         decoded_teacher_strong = batched_decode_preds(
             strong_preds_teacher,
@@ -635,9 +638,10 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_teacher.keys():
-            self.test_psds_buffer_teacher[th] = self.test_psds_buffer_teacher[
-                th
-            ].append(decoded_teacher_strong[th], ignore_index=True)
+            self.test_psds_buffer_teacher[th] = pd.concat(
+                [self.test_psds_buffer_teacher[th], decoded_teacher_strong[th]],
+                ignore_index=True,
+            )
 
         # compute f1 score
         decoded_student_strong = batched_decode_preds(
@@ -648,8 +652,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_student_05_buffer = self.decoded_student_05_buffer.append(
-            decoded_student_strong[0.5]
+        self.decoded_student_05_buffer = pd.concat(
+            [self.decoded_student_05_buffer, decoded_student_strong[0.5]],
+            ignore_index=True,
         )
 
         decoded_teacher_strong = batched_decode_preds(
@@ -660,8 +665,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_teacher_05_buffer = self.decoded_teacher_05_buffer.append(
-            decoded_teacher_strong[0.5]
+        self.decoded_teacher_05_buffer = pd.concat(
+            [self.decoded_teacher_05_buffer, decoded_teacher_strong[0.5]],
+            ignore_index=True,
         )
 
     def on_test_epoch_end(self):
