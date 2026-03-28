@@ -12,7 +12,6 @@ import yaml
 from desed_task.dataio import ConcatDatasetBatchSampler
 from desed_task.dataio.datasets import (StronglyAnnotatedSet, UnlabeledSet,
                                         WeakSet)
-from desed_task.nnet.CRNN import CRNN
 from desed_task.utils.encoder import ManyHotEncoder
 from desed_task.utils.schedulers import ExponentialWarmup
 from local.classes_dict import classes_labels
@@ -21,6 +20,7 @@ from local.sed_trainer import SEDTask4
 from local.utils import generate_tsv_wav_durations
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from sed_modeling import build_sed_model
 
 
 def _build_trainer_kwargs(
@@ -157,7 +157,7 @@ def single_run(
     test_dataset = devtest_dataset
 
     ##### model definition  ############
-    sed_student = CRNN(**config["net"])
+    sed_student = build_sed_model(config)
 
     if test_state_dict is None:
         ##### data prep train valid ##########
@@ -256,7 +256,16 @@ def single_run(
                 ),
             )
 
-        opt = torch.optim.Adam(sed_student.parameters(), 1e-3, betas=(0.9, 0.999))
+        trainable_parameters = [
+            parameter
+            for parameter in sed_student.parameters()
+            if parameter.requires_grad
+        ]
+        if len(trainable_parameters) == 0:
+            raise RuntimeError("No trainable parameters were found for the selected encoder/decoder setup.")
+        opt = torch.optim.Adam(
+            trainable_parameters, config["opt"]["lr"], betas=(0.9, 0.999)
+        )
         exp_steps = config["training"]["n_epochs_warmup"] * epoch_len
         exp_scheduler = {
             "scheduler": ExponentialWarmup(opt, config["opt"]["lr"], exp_steps),
@@ -352,7 +361,7 @@ def single_run(
         trainer.fit(desed_training, **fit_kwargs)
         best_path = trainer.checkpoint_callback.best_model_path
         print(f"best model: {best_path}")
-        test_state_dict = torch.load(best_path)["state_dict"]
+        test_state_dict = torch.load(best_path, weights_only=False)["state_dict"]
 
     desed_training.load_state_dict(test_state_dict)
     trainer.test(desed_training)
@@ -428,9 +437,10 @@ if __name__ == "__main__":
 
     test_model_state_dict = None
     if test_from_checkpoint is not None:
-        checkpoint = torch.load(test_from_checkpoint)
+        checkpoint = torch.load(test_from_checkpoint, weights_only=False)
         configs_ckpt = checkpoint["hyper_parameters"]
         configs_ckpt["data"] = configs["data"]
+        configs = configs_ckpt
         print(
             f"loaded model: {test_from_checkpoint} \n"
             f"at epoch: {checkpoint['epoch']}"

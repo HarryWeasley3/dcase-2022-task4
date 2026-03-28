@@ -5,7 +5,8 @@ training:
   const_max: 2
   n_epochs_warmup: 50
   num_workers: 6
-  n_epochs: 200
+  # n_epochs: 200
+  n_epochs: 40
   early_stop_patience: 200
   accumulate_batches: 1
   gradient_clip: 0.0
@@ -77,14 +78,18 @@ net:
   pooling: [[2, 2], [2, 2], [1, 2], [1, 2], [1, 2], [1, 2], [1, 2]]
   dropout_recurrent: 0
 model:
-  encoder_type: crnn
+  encoder_type: beats
   align:
     method: interpolate
     interpolate_mode: linear
-  crnn_encoder:
-    train_cnn: true
+  beats:
+    checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
+    freeze: true
+    feature_layer: null
+    fbank_mean: 15.41663
+    fbank_std: 6.55582
   decoder:
-    input_proj_dim: null
+    input_proj_dim: 256
     use_gru: true
     hidden_dim: 128
     rnn_layers: 2

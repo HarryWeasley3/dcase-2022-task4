@@ -84,7 +84,7 @@ model:
   crnn_encoder:
     train_cnn: true
   decoder:
-    input_proj_dim: null
+    input_proj_dim: 256
     use_gru: true
     hidden_dim: 128
     rnn_layers: 2

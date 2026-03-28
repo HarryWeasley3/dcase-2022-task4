@@ -13,7 +13,6 @@ from desed_task.data_augm import mixup
 from desed_task.evaluation.evaluation_measures import (
     compute_per_intersection_macro_f1, compute_psds_from_operating_points)
 from desed_task.utils.scaler import TorchScaler
-from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 
 from .utils import batched_decode_preds, log_sedeval_metrics
 
@@ -76,7 +75,15 @@ class SEDTask4(pl.LightningModule):
         self.encoder = encoder
         self.sed_student = sed_student
         if sed_teacher is None:
-            self.sed_teacher = deepcopy(sed_student)
+            share_encoder = self.hparams.get("model", {}).get("teacher", {}).get(
+                "share_frozen_encoder", True
+            )
+            if hasattr(sed_student, "make_teacher_copy"):
+                self.sed_teacher = sed_student.make_teacher_copy(
+                    share_encoder_if_frozen=share_encoder
+                )
+            else:
+                self.sed_teacher = deepcopy(sed_student)
         else:
             self.sed_teacher = sed_teacher
         self.opt = opt
@@ -94,20 +101,6 @@ class SEDTask4(pl.LightningModule):
             self.num_workers = 1
         else:
             self.num_workers = self.hparams["training"]["num_workers"]
-
-        feat_params = self.hparams["feats"]
-        self.mel_spec = MelSpectrogram(
-            sample_rate=feat_params["sample_rate"],
-            n_fft=feat_params["n_window"],
-            win_length=feat_params["n_window"],
-            hop_length=feat_params["hop_length"],
-            f_min=feat_params["f_min"],
-            f_max=feat_params["f_max"],
-            n_mels=feat_params["n_mels"],
-            window_fn=torch.hamming_window,
-            wkwargs={"periodic": False},
-            power=1,
-        )
 
         for param in self.sed_teacher.parameters():
             param.detach_()
@@ -130,7 +123,12 @@ class SEDTask4(pl.LightningModule):
             len(self.encoder.labels)
         )
 
-        self.scaler = self._init_scaler()
+        if getattr(self.sed_student, "needs_input_scaler", False):
+            self.scaler = self._init_scaler()
+            self.sed_student.set_input_scaler(self.scaler)
+            self.sed_teacher.set_input_scaler(self.scaler)
+        else:
+            self.scaler = None
         # buffer for event based scores which we compute using sed-eval
 
         self.val_buffer_student_synth = {
@@ -218,7 +216,7 @@ class SEDTask4(pl.LightningModule):
         self.train_loader = self.train_dataloader()
         scaler.fit(
             self.train_loader,
-            transform_func=lambda x: self.take_log(self.mel_spec(x[0])),
+            transform_func=lambda batch: self.sed_student.prepare_inputs(batch[0]),
         )
 
         if self.hparams["scaler"]["savepath"] is not None:
@@ -230,21 +228,15 @@ class SEDTask4(pl.LightningModule):
             )
             return scaler
 
-    def take_log(self, mels):
-        """Apply the log transformation to mel spectrograms.
-        Args:
-            mels: torch.Tensor, mel spectrograms for which to apply log.
-
-        Returns:
-            Tensor: logarithmic mel spectrogram of the mel spectrogram given as input
-        """
-
-        amp_to_db = AmplitudeToDB(stype="amplitude")
-        amp_to_db.amin = 1e-5  # amin= 1e-5 as in librosa
-        return amp_to_db(mels).clamp(min=-50, max=80)  # clamp to reproduce old code
-
-    def detect(self, mel_feats, model):
-        return model(self.scaler(self.take_log(mel_feats)))
+    def detect(self, audio, model, target_frame_len):
+        outputs = model(audio, target_frame_len=target_frame_len)
+        if isinstance(outputs, dict):
+            return outputs["strong_preds"], outputs["weak_preds"], outputs
+        strong_preds, weak_preds = outputs
+        return strong_preds, weak_preds, {
+            "strong_preds": strong_preds,
+            "weak_preds": weak_preds,
+        }
 
     def training_step(self, batch, batch_indx):
         """Apply the training for one batch (a step). Used during trainer.fit
@@ -258,20 +250,20 @@ class SEDTask4(pl.LightningModule):
         """
 
         audio, labels, padded_indxs = batch
-        features = self.mel_spec(audio)
+        del padded_indxs
 
-        batch_num = features.shape[0]
+        batch_num = audio.shape[0]
         if self.synth_only:
-            strong_mask = torch.ones(batch_num).to(features).bool()
-            weak_mask = torch.zeros(batch_num).to(features).bool()
+            strong_mask = torch.ones(batch_num).to(audio).bool()
+            weak_mask = torch.zeros(batch_num).to(audio).bool()
             labels_weak = None
         else:
             indx_synth, indx_weak, indx_unlabelled = self.hparams["training"][
                 "batch_size"
             ]
             # deriving masks for each dataset
-            strong_mask = torch.zeros(batch_num).to(features).bool()
-            weak_mask = torch.zeros(batch_num).to(features).bool()
+            strong_mask = torch.zeros(batch_num).to(audio).bool()
+            weak_mask = torch.zeros(batch_num).to(audio).bool()
             strong_mask[:indx_synth] = 1
             weak_mask[indx_synth : indx_weak + indx_synth] = 1
 
@@ -281,16 +273,16 @@ class SEDTask4(pl.LightningModule):
         mixup_type = self.hparams["training"].get("mixup")
         if mixup_type is not None and 0.5 > random.random():
             if torch.any(weak_mask):
-                features[weak_mask], labels_weak = mixup(
-                    features[weak_mask], labels_weak, mixup_label_type=mixup_type
+                audio[weak_mask], labels_weak = mixup(
+                    audio[weak_mask], labels_weak, mixup_label_type=mixup_type
                 )
-            features[strong_mask], labels[strong_mask] = mixup(
-                features[strong_mask], labels[strong_mask], mixup_label_type=mixup_type
+            audio[strong_mask], labels[strong_mask] = mixup(
+                audio[strong_mask], labels[strong_mask], mixup_label_type=mixup_type
             )
 
         # sed student forward
-        strong_preds_student, weak_preds_student = self.detect(
-            features, self.sed_student
+        strong_preds_student, weak_preds_student, _ = self.detect(
+            audio, self.sed_student, target_frame_len=labels.shape[-1]
         )
 
         # supervised loss on strong labels
@@ -304,12 +296,12 @@ class SEDTask4(pl.LightningModule):
             )
             tot_loss_supervised = loss_strong + loss_weak
         else:
-            loss_weak = torch.zeros((), device=features.device)
+            loss_weak = torch.zeros((), device=audio.device)
             tot_loss_supervised = loss_strong
 
         with torch.no_grad():
-            strong_preds_teacher, weak_preds_teacher = self.detect(
-                features, self.sed_teacher
+            strong_preds_teacher, weak_preds_teacher, _ = self.detect(
+                audio, self.sed_teacher, target_frame_len=labels.shape[-1]
             )
             loss_strong_teacher = self.supervised_loss(
                 strong_preds_teacher[strong_mask], labels[strong_mask]
@@ -320,7 +312,7 @@ class SEDTask4(pl.LightningModule):
                     weak_preds_teacher[weak_mask], labels_weak
                 )
             else:
-                loss_weak_teacher = torch.zeros((), device=features.device)
+                loss_weak_teacher = torch.zeros((), device=audio.device)
         # we apply consistency between the predictions, use the scheduler for learning rate (to be changed ?)
         weight = (
             self.hparams["training"]["const_max"]
@@ -337,17 +329,49 @@ class SEDTask4(pl.LightningModule):
 
         tot_loss = tot_loss_supervised + tot_self_loss
 
-        self.log("train/student/loss_strong", loss_strong)
-        self.log("train/student/loss_weak", loss_weak)
-        self.log("train/teacher/loss_strong", loss_strong_teacher)
-        self.log("train/teacher/loss_weak", loss_weak_teacher)
-        self.log("train/step", self.scheduler["scheduler"].step_num, prog_bar=True)
-        self.log("train/student/tot_self_loss", tot_self_loss, prog_bar=True)
-        self.log("train/weight", weight)
-        self.log("train/student/tot_supervised", strong_self_sup_loss, prog_bar=True)
-        self.log("train/student/weak_self_sup_loss", weak_self_sup_loss)
-        self.log("train/student/strong_self_sup_loss", strong_self_sup_loss)
-        self.log("train/lr", self.opt.param_groups[-1]["lr"], prog_bar=True)
+        self.log("train/student/loss_strong", loss_strong, batch_size=batch_num)
+        self.log("train/student/loss_weak", loss_weak, batch_size=batch_num)
+        self.log(
+            "train/teacher/loss_strong",
+            loss_strong_teacher,
+            batch_size=batch_num,
+        )
+        self.log("train/teacher/loss_weak", loss_weak_teacher, batch_size=batch_num)
+        self.log(
+            "train/step",
+            self.scheduler["scheduler"].step_num,
+            prog_bar=True,
+            batch_size=batch_num,
+        )
+        self.log(
+            "train/student/tot_self_loss",
+            tot_self_loss,
+            prog_bar=True,
+            batch_size=batch_num,
+        )
+        self.log("train/weight", weight, batch_size=batch_num)
+        self.log(
+            "train/student/tot_supervised",
+            tot_loss_supervised,
+            prog_bar=True,
+            batch_size=batch_num,
+        )
+        self.log(
+            "train/student/weak_self_sup_loss",
+            weak_self_sup_loss,
+            batch_size=batch_num,
+        )
+        self.log(
+            "train/student/strong_self_sup_loss",
+            strong_self_sup_loss,
+            batch_size=batch_num,
+        )
+        self.log(
+            "train/lr",
+            self.opt.param_groups[-1]["lr"],
+            prog_bar=True,
+            batch_size=batch_num,
+        )
 
         return tot_loss
 
@@ -370,12 +394,17 @@ class SEDTask4(pl.LightningModule):
         """
 
         audio, labels, padded_indxs, filenames = batch
+        del padded_indxs
+        batch_size = audio.shape[0]
 
         # prediction for student
-        mels = self.mel_spec(audio)
-        strong_preds_student, weak_preds_student = self.detect(mels, self.sed_student)
+        strong_preds_student, weak_preds_student, _ = self.detect(
+            audio, self.sed_student, target_frame_len=labels.shape[-1]
+        )
         # prediction for teacher
-        strong_preds_teacher, weak_preds_teacher = self.detect(mels, self.sed_teacher)
+        strong_preds_teacher, weak_preds_teacher, _ = self.detect(
+            audio, self.sed_teacher, target_frame_len=labels.shape[-1]
+        )
 
         # we derive masks for each dataset based on folders of filenames
         mask_weak = (
@@ -411,8 +440,16 @@ class SEDTask4(pl.LightningModule):
             loss_weak_teacher = self.supervised_loss(
                 weak_preds_teacher[mask_weak], labels_weak
             )
-            self.log("val/weak/student/loss_weak", loss_weak_student)
-            self.log("val/weak/teacher/loss_weak", loss_weak_teacher)
+            self.log(
+                "val/weak/student/loss_weak",
+                loss_weak_student,
+                batch_size=batch_size,
+            )
+            self.log(
+                "val/weak/teacher/loss_weak",
+                loss_weak_teacher,
+                batch_size=batch_size,
+            )
 
             # accumulate f1 score for weak labels
             self.get_weak_student_f1_seg_macro(
@@ -430,8 +467,16 @@ class SEDTask4(pl.LightningModule):
                 strong_preds_teacher[mask_synth], labels[mask_synth]
             )
 
-            self.log("val/synth/student/loss_strong", loss_strong_student)
-            self.log("val/synth/teacher/loss_strong", loss_strong_teacher)
+            self.log(
+                "val/synth/student/loss_strong",
+                loss_strong_student,
+                batch_size=batch_size,
+            )
+            self.log(
+                "val/synth/teacher/loss_strong",
+                loss_strong_teacher,
+                batch_size=batch_size,
+            )
 
             filenames_synth = [
                 x
@@ -565,19 +610,32 @@ class SEDTask4(pl.LightningModule):
         """
 
         audio, labels, padded_indxs, filenames = batch
+        del padded_indxs
+        batch_size = audio.shape[0]
 
         # prediction for student
-        mels = self.mel_spec(audio)
-        strong_preds_student, weak_preds_student = self.detect(mels, self.sed_student)
+        strong_preds_student, weak_preds_student, _ = self.detect(
+            audio, self.sed_student, target_frame_len=labels.shape[-1]
+        )
         # prediction for teacher
-        strong_preds_teacher, weak_preds_teacher = self.detect(mels, self.sed_teacher)
+        strong_preds_teacher, weak_preds_teacher, _ = self.detect(
+            audio, self.sed_teacher, target_frame_len=labels.shape[-1]
+        )
 
         if not self.evaluation:
             loss_strong_student = self.supervised_loss(strong_preds_student, labels)
             loss_strong_teacher = self.supervised_loss(strong_preds_teacher, labels)
 
-            self.log("test/student/loss_strong", loss_strong_student)
-            self.log("test/teacher/loss_strong", loss_strong_teacher)
+            self.log(
+                "test/student/loss_strong",
+                loss_strong_student,
+                batch_size=batch_size,
+            )
+            self.log(
+                "test/teacher/loss_strong",
+                loss_strong_teacher,
+                batch_size=batch_size,
+            )
 
         # compute psds
         decoded_student_strong = batched_decode_preds(
