@@ -1,5 +1,6 @@
 import os
 import random
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -154,6 +155,29 @@ class SEDTask4(pl.LightningModule):
         self.decoded_student_05_buffer = pd.DataFrame()
         self.decoded_teacher_05_buffer = pd.DataFrame()
 
+    def _disable_autocast_context(self):
+        if self.device.type == "cuda":
+            return torch.amp.autocast("cuda", enabled=False)
+        return nullcontext()
+
+    def _sanitize_probabilities(self, preds):
+        preds = torch.nan_to_num(preds.float(), nan=0.5, posinf=1.0, neginf=0.0)
+        return preds.clamp(min=1e-6, max=1.0 - 1e-6)
+
+    def _compute_supervised_loss(self, preds, targets):
+        with self._disable_autocast_context():
+            safe_preds = self._sanitize_probabilities(preds)
+            safe_targets = targets.float().clamp(min=0.0, max=1.0)
+            return self.supervised_loss(safe_preds, safe_targets)
+
+    def _compute_selfsup_loss(self, preds, targets):
+        if not isinstance(self.selfsup_loss, torch.nn.BCELoss):
+            return self.selfsup_loss(preds, targets)
+        with self._disable_autocast_context():
+            safe_preds = self._sanitize_probabilities(preds)
+            safe_targets = self._sanitize_probabilities(targets)
+            return self.selfsup_loss(safe_preds, safe_targets)
+
     def on_train_start(self) -> None:
         os.makedirs(os.path.join(self.exp_dir, "training_codecarbon"), exist_ok=True)
         self.tracker_train = EmissionsTracker(
@@ -286,12 +310,12 @@ class SEDTask4(pl.LightningModule):
         )
 
         # supervised loss on strong labels
-        loss_strong = self.supervised_loss(
+        loss_strong = self._compute_supervised_loss(
             strong_preds_student[strong_mask], labels[strong_mask]
         )
         if torch.any(weak_mask):
             # supervised loss on weakly labelled
-            loss_weak = self.supervised_loss(
+            loss_weak = self._compute_supervised_loss(
                 weak_preds_student[weak_mask], labels_weak
             )
             tot_loss_supervised = loss_strong + loss_weak
@@ -303,12 +327,12 @@ class SEDTask4(pl.LightningModule):
             strong_preds_teacher, weak_preds_teacher, _ = self.detect(
                 audio, self.sed_teacher, target_frame_len=labels.shape[-1]
             )
-            loss_strong_teacher = self.supervised_loss(
+            loss_strong_teacher = self._compute_supervised_loss(
                 strong_preds_teacher[strong_mask], labels[strong_mask]
             )
 
             if torch.any(weak_mask):
-                loss_weak_teacher = self.supervised_loss(
+                loss_weak_teacher = self._compute_supervised_loss(
                     weak_preds_teacher[weak_mask], labels_weak
                 )
             else:
@@ -319,10 +343,10 @@ class SEDTask4(pl.LightningModule):
             * self.scheduler["scheduler"]._get_scaling_factor()
         )
 
-        strong_self_sup_loss = self.selfsup_loss(
+        strong_self_sup_loss = self._compute_selfsup_loss(
             strong_preds_student, strong_preds_teacher.detach()
         )
-        weak_self_sup_loss = self.selfsup_loss(
+        weak_self_sup_loss = self._compute_selfsup_loss(
             weak_preds_student, weak_preds_teacher.detach()
         )
         tot_self_loss = (strong_self_sup_loss + weak_self_sup_loss) * weight
@@ -434,10 +458,10 @@ class SEDTask4(pl.LightningModule):
             self.has_weak_validation = True
             labels_weak = (torch.sum(labels[mask_weak], -1) >= 1).float()
 
-            loss_weak_student = self.supervised_loss(
+            loss_weak_student = self._compute_supervised_loss(
                 weak_preds_student[mask_weak], labels_weak
             )
-            loss_weak_teacher = self.supervised_loss(
+            loss_weak_teacher = self._compute_supervised_loss(
                 weak_preds_teacher[mask_weak], labels_weak
             )
             self.log(
@@ -460,10 +484,10 @@ class SEDTask4(pl.LightningModule):
             )
 
         if torch.any(mask_synth):
-            loss_strong_student = self.supervised_loss(
+            loss_strong_student = self._compute_supervised_loss(
                 strong_preds_student[mask_synth], labels[mask_synth]
             )
-            loss_strong_teacher = self.supervised_loss(
+            loss_strong_teacher = self._compute_supervised_loss(
                 strong_preds_teacher[mask_synth], labels[mask_synth]
             )
 
@@ -623,8 +647,8 @@ class SEDTask4(pl.LightningModule):
         )
 
         if not self.evaluation:
-            loss_strong_student = self.supervised_loss(strong_preds_student, labels)
-            loss_strong_teacher = self.supervised_loss(strong_preds_teacher, labels)
+            loss_strong_student = self._compute_supervised_loss(strong_preds_student, labels)
+            loss_strong_teacher = self._compute_supervised_loss(strong_preds_teacher, labels)
 
             self.log(
                 "test/student/loss_strong",

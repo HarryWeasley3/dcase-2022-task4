@@ -80,7 +80,12 @@ class BEATsEncoder(nn.Module):
 
     def forward(self, audio, padding_mask=None):
         if self.is_frozen:
-            with torch.no_grad():
+            autocast_context = (
+                torch.amp.autocast("cuda", enabled=False)
+                if audio.device.type == "cuda"
+                else torch.autocast("cpu", enabled=False)
+            )
+            with torch.no_grad(), autocast_context:
                 return self._extract_sequence_features(audio, padding_mask=padding_mask)
         return self._extract_sequence_features(audio, padding_mask=padding_mask)
 

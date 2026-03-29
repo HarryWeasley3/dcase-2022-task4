@@ -49,3 +49,23 @@ class TimeAligner(nn.Module):
             raise ValueError(f"Unsupported alignment method: {self.method}")
 
         return aligned.transpose(1, 2).contiguous()
+
+
+class FusionTimeAligner(TimeAligner):
+    """Align one encoder stream to another encoder stream before late fusion.
+
+    The late-fusion CRNN+BEATs model first aligns BEATs frame embeddings to the
+    CNN branch time grid, then concatenates features and continues with the
+    shared temporal classifier stack. This is intentionally separate from the
+    final label-grid alignment used by the generic encoder-decoder path.
+    """
+
+    def __init__(self, method="adaptive_avg", interpolate_mode="linear"):
+        super().__init__(method=method, interpolate_mode=interpolate_mode)
+
+    def forward(self, sequence, reference):
+        if torch.is_tensor(reference):
+            target_length = reference.shape[1]
+        else:
+            target_length = int(reference)
+        return super().forward(sequence, target_length)

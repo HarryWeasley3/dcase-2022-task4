@@ -4,7 +4,9 @@ import torch.nn as nn
 
 from sed_modeling.decoders import SEDDecoder
 from sed_modeling.encoders import BEATsEncoder, CRNNEncoder
-from sed_modeling.modules import TimeAligner
+from sed_modeling.modules import FusionTimeAligner, MergeMLP, TimeAligner
+
+from .crnn_beats_late_fusion import CRNNBEATsLateFusionModel
 
 
 def _deep_update(base, override):
@@ -19,6 +21,7 @@ def _deep_update(base, override):
 def resolve_model_config(config):
     net_cfg = config.get("net", {})
     model_cfg = {
+        "model_type": "single_encoder",
         "encoder_type": "crnn",
         "align": {
             "method": "interpolate",
@@ -55,8 +58,19 @@ def resolve_model_config(config):
             "dropout_recurrent": net_cfg.get("dropout_recurrent", 0.0),
             "attention": net_cfg.get("attention", True),
         },
+        "fusion": {
+            "enabled": False,
+            "fusion_type": "concat",
+            "align_method": "adaptive_avg",
+            "interpolate_mode": "linear",
+            "merge_mlp_dim": 256,
+            "merge_activation": "gelu",
+            "merge_dropout": net_cfg.get("dropout", 0.5),
+            "use_layernorm": False,
+        },
         "teacher": {
             "share_frozen_encoder": True,
+            "share_frozen_beats": True,
         },
     }
 
@@ -141,10 +155,51 @@ class SEDModel(nn.Module):
 
 def build_sed_model(config):
     model_cfg = resolve_model_config(config)
+    model_type = model_cfg.get("model_type", "single_encoder").lower()
     encoder_type = model_cfg["encoder_type"].lower()
     num_classes = config.get("net", {}).get("nclass")
     if num_classes is None:
         raise ValueError("config['net']['nclass'] must be defined for the shared decoder.")
+
+    if model_type == "crnn_beats_late_fusion":
+        crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
+        beats_encoder = BEATsEncoder(**model_cfg["beats"])
+        fusion_cfg = model_cfg["fusion"]
+        fusion_aligner = FusionTimeAligner(
+            method=fusion_cfg.get("align_method", "adaptive_avg"),
+            interpolate_mode=fusion_cfg.get("interpolate_mode", "linear"),
+        )
+        fusion_type = fusion_cfg.get("fusion_type", "concat").lower()
+        if fusion_type == "concat":
+            fusion_input_dim = crnn_encoder.output_dim + beats_encoder.output_dim
+        elif fusion_type == "add":
+            fusion_input_dim = crnn_encoder.output_dim
+        else:
+            raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+
+        merge_mlp = MergeMLP(
+            input_dim=fusion_input_dim,
+            output_dim=fusion_cfg.get("merge_mlp_dim", 256),
+            activation=fusion_cfg.get("merge_activation", "gelu"),
+            dropout=fusion_cfg.get("merge_dropout", 0.5),
+            use_layernorm=fusion_cfg.get("use_layernorm", False),
+        )
+        label_aligner = TimeAligner(**model_cfg["align"])
+        decoder = SEDDecoder(
+            input_dim=fusion_cfg.get("merge_mlp_dim", 256),
+            n_classes=num_classes,
+            **model_cfg["decoder"],
+        )
+        return CRNNBEATsLateFusionModel(
+            crnn_encoder=crnn_encoder,
+            beats_encoder=beats_encoder,
+            fusion_aligner=fusion_aligner,
+            merge_mlp=merge_mlp,
+            decoder=decoder,
+            label_aligner=label_aligner,
+            fusion_type=fusion_type,
+            build_config=config,
+        )
 
     if encoder_type == "crnn":
         encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])

@@ -40,3 +40,5 @@ wandb/
 
 runtime_data/
 exp/
+pretrained/
+.codex
