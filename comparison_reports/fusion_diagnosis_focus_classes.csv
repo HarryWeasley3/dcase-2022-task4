@@ -1,0 +1,8 @@
+class,fusion_event,fusion_segment,fusion_pred,zero_beats_event,zero_beats_segment,zero_beats_pred,zero_cnn_event,zero_cnn_segment,zero_cnn_pred,shuffle_beats_event,shuffle_beats_segment,shuffle_beats_pred,crnn_event,crnn_segment,crnn_pred
+Dishes,15.51,21.72,200,13.04,20.9,225,0.0,,0,10.58,15.41,127,29.12,50.28,621
+Dog,15.88,33.24,130,12.57,39.83,405,0.0,,0,15.45,34.49,136,32.4,59.67,376
+Alarm_bell_ringing,21.18,59.6,249,24.76,66.58,409,0.0,,0,19.19,58.01,236,20.5,63.85,330
+Cat,34.37,70.61,310,37.48,72.29,382,0.0,,0,31.41,69.9,316,30.0,73.24,451
+Running_water,53.1,71.77,210,47.19,71.31,228,1.08,9.41,616,42.73,72.26,237,49.47,71.41,349
+Frying,67.36,83.52,392,56.59,76.87,291,27.09,30.52,1956,61.35,80.47,376,65.32,83.84,364
+Vacuum_cleaner,67.55,74.82,202,51.34,65.28,158,0.0,,0,61.09,70.01,191,69.3,81.31,280

@@ -1,0 +1,6 @@
+variant,intersection,event_macro,event_micro,segment_macro,segment_micro,pred_events,pred_files
+fusion,0.583454,41.35,40.6,64.02,72.14,6019,2424
+zero_beats,0.559243,34.98,31.7,63.47,73.95,7510,2478
+zero_cnn,0.178606,2.82,6.0,19.97,13.08,2572,2351
+shuffle_beats,0.564336,36.89,37.8,62.3,70.3,5716,2401
+crnn,0.650249,43.35,43.2,71.14,75.59,7203,2466

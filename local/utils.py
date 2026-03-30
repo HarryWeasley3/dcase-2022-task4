@@ -42,7 +42,7 @@ def batched_decode_preds(
             if pad_indx is not None:
                 true_len = int(c_preds.shape[-1] * pad_indx[j].item())
                 c_preds = c_preds[:true_len]
-            pred = c_preds.transpose(0, 1).detach().cpu().numpy()
+            pred = c_preds.transpose(0, 1).detach().float().cpu().numpy()
             pred = pred > c_th
             pred = scipy.ndimage.filters.median_filter(pred, (median_filter, 1))
             pred = encoder.decode_strong(pred)

@@ -1,0 +1,4 @@
+group,count,avg_delta,long_duration_ratio,short_event_ratio,animal_ratio,device_like_ratio,weak_focus_ratio,multi_event_ratio,avg_gt_events
+fusion_loss,609,-0.3761,0.514,0.7816,0.2693,0.5238,0.6601,0.9754,3.48
+fusion_win,375,0.3645,0.6427,0.6533,0.208,0.672,0.536,0.9653,3.34
+similar,1516,0.0058,0.6339,0.6168,0.2348,0.5726,0.6029,0.9446,3.14
