@@ -3,7 +3,7 @@ from copy import deepcopy
 import torch.nn as nn
 
 from sed_modeling.decoders import SEDDecoder
-from sed_modeling.encoders import BEATsEncoder, CRNNEncoder
+from sed_modeling.encoders import BEATsEncoder, CRNNEncoder, WavLMEncoder
 from sed_modeling.modules import (
     FusionTimeAligner,
     MergeMLP,
@@ -52,6 +52,14 @@ def resolve_model_config(config):
             "feature_layer": None,
             "fbank_mean": 15.41663,
             "fbank_std": 6.55582,
+        },
+        "wavlm": {
+            "checkpoint": "",
+            "bundle_name": "WAVLM_BASE_PLUS",
+            "freeze": True,
+            "output_layer": None,
+            "use_bundle_weights": True,
+            "normalize_waveform": False,
         },
         "decoder": {
             "input_proj_dim": None,
@@ -267,6 +275,8 @@ def build_sed_model(config):
         encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
     elif encoder_type == "beats":
         encoder = BEATsEncoder(**model_cfg["beats"])
+    elif encoder_type == "wavlm":
+        encoder = WavLMEncoder(**model_cfg["wavlm"])
     else:
         raise ValueError(f"Unsupported encoder_type: {encoder_type}")
 

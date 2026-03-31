@@ -437,7 +437,10 @@ if __name__ == "__main__":
 
     test_model_state_dict = None
     if test_from_checkpoint is not None:
-        checkpoint = torch.load(test_from_checkpoint, weights_only=False)
+        map_location = None if torch.cuda.is_available() else torch.device("cpu")
+        checkpoint = torch.load(
+            test_from_checkpoint, map_location=map_location, weights_only=False
+        )
         configs_ckpt = checkpoint["hyper_parameters"]
         configs_ckpt["data"] = configs["data"]
         configs = configs_ckpt
