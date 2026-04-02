@@ -13,6 +13,7 @@ from sed_modeling.modules import (
 
 from .crnn_beats_late_fusion import CRNNBEATsLateFusionModel
 from .crnn_beats_residual_gated_fusion import CRNNBEATsResidualGatedFusionModel
+from .crnn_wavlm_residual_gated_fusion import CRNNWavLMResidualGatedFusionModel
 
 
 def _deep_update(base, override):
@@ -96,6 +97,7 @@ def resolve_model_config(config):
         "teacher": {
             "share_frozen_encoder": True,
             "share_frozen_beats": True,
+            "share_frozen_wavlm": True,
         },
     }
 
@@ -264,6 +266,51 @@ def build_sed_model(config):
         return CRNNBEATsResidualGatedFusionModel(
             crnn_encoder=crnn_encoder,
             beats_encoder=beats_encoder,
+            fusion_aligner=fusion_aligner,
+            fusion_block=fusion_block,
+            decoder=decoder,
+            label_aligner=label_aligner,
+            build_config=config,
+        )
+
+    if model_type == "crnn_wavlm_residual_gated_fusion":
+        crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
+        wavlm_encoder = WavLMEncoder(**model_cfg["wavlm"])
+        fusion_cfg = model_cfg["fusion"]
+        fusion_aligner = FusionTimeAligner(
+            method=fusion_cfg.get("align_method", "adaptive_avg"),
+            interpolate_mode=fusion_cfg.get("interpolate_mode", "linear"),
+        )
+        norm_type = fusion_cfg.get("norm_type", "layernorm").lower()
+        if norm_type != "layernorm":
+            raise ValueError(
+                "Residual gated fusion currently supports norm_type='layernorm' only."
+            )
+
+        fuse_dim = fusion_cfg.get("fuse_dim", fusion_cfg.get("merge_mlp_dim", 256))
+        fusion_block = ResidualGatedFusion(
+            cnn_input_dim=crnn_encoder.output_dim,
+            beats_input_dim=wavlm_encoder.output_dim,
+            fuse_dim=fuse_dim,
+            gate_mode=fusion_cfg.get("gate_mode", "channel"),
+            gate_hidden_dim=fusion_cfg.get("gate_hidden_dim"),
+            gate_activation=fusion_cfg.get("gate_activation", "gelu"),
+            gate_dropout=fusion_cfg.get("gate_dropout", 0.5),
+            use_post_fusion_proj=fusion_cfg.get("use_post_fusion_proj", True),
+            post_fusion_dim=fusion_cfg.get("post_fusion_dim", fuse_dim),
+            post_fusion_dropout=fusion_cfg.get("post_fusion_dropout", 0.5),
+            use_alpha_scale=fusion_cfg.get("use_alpha_scale", False),
+            alpha_init=fusion_cfg.get("alpha_init", 1.0),
+        )
+        label_aligner = TimeAligner(**model_cfg["align"])
+        decoder = SEDDecoder(
+            input_dim=fusion_block.output_dim,
+            n_classes=num_classes,
+            **model_cfg["decoder"],
+        )
+        return CRNNWavLMResidualGatedFusionModel(
+            crnn_encoder=crnn_encoder,
+            wavlm_encoder=wavlm_encoder,
             fusion_aligner=fusion_aligner,
             fusion_block=fusion_block,
             decoder=decoder,

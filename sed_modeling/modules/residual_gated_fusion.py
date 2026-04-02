@@ -107,8 +107,10 @@ class ResidualGatedFusion(nn.Module):
         return {
             "cnn_projected": cnn_projected,
             "beats_projected": beats_projected,
+            "auxiliary_projected": beats_projected,
             "cnn_normalized": cnn_normalized,
             "beats_normalized": beats_normalized,
+            "auxiliary_normalized": beats_normalized,
             "gate": gate,
             "fused": fused,
             "fused_output": fused_output,
