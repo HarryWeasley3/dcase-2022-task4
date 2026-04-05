@@ -157,7 +157,9 @@ class SEDTask4(pl.LightningModule):
 
     def _disable_autocast_context(self):
         if self.device.type == "cuda":
-            return torch.amp.autocast("cuda", enabled=False)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+                return torch.amp.autocast("cuda", enabled=False)
+            return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
     def _sanitize_probabilities(self, preds):

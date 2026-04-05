@@ -23,6 +23,13 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from sed_modeling import build_sed_model
 
 
+def _torch_load_compat(path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _build_trainer_kwargs(
     config, gpus, n_epochs, callbacks, logger, checkpoint_resume, flush_logs_every_n_steps
 ):
@@ -361,7 +368,7 @@ def single_run(
         trainer.fit(desed_training, **fit_kwargs)
         best_path = trainer.checkpoint_callback.best_model_path
         print(f"best model: {best_path}")
-        test_state_dict = torch.load(best_path, weights_only=False)["state_dict"]
+        test_state_dict = _torch_load_compat(best_path)["state_dict"]
 
     desed_training.load_state_dict(test_state_dict)
     trainer.test(desed_training)
@@ -438,9 +445,7 @@ if __name__ == "__main__":
     test_model_state_dict = None
     if test_from_checkpoint is not None:
         map_location = None if torch.cuda.is_available() else torch.device("cpu")
-        checkpoint = torch.load(
-            test_from_checkpoint, map_location=map_location, weights_only=False
-        )
+        checkpoint = _torch_load_compat(test_from_checkpoint, map_location=map_location)
         configs_ckpt = checkpoint["hyper_parameters"]
         configs_ckpt["data"] = configs["data"]
         configs = configs_ckpt

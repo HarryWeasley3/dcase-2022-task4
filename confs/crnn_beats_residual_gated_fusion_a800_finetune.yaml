@@ -1,0 +1,117 @@
+training:
+  synth_only: true
+  batch_size: 8
+  batch_size_val: 8
+  const_max: 2
+  n_epochs_warmup: 10
+  n_epochs: 120
+  early_stop_patience: 30
+  accumulate_batches: 1
+  gradient_clip: 1.0
+  median_window: 7
+  val_thresholds: [0.5]
+  n_test_thresholds: 50
+  ema_factor: 0.999
+  self_sup_loss: mse
+  backend: null
+  validation_interval: 1
+  weak_split: 0.9
+  seed: 42
+  precision: 16
+  mixup: soft
+  obj_metric_synth_type: intersection
+  num_workers: 8
+scaler:
+  statistic: instance
+  normtype: minmax
+  dims: [1, 2]
+  savepath: ./scaler.ckpt
+data:
+  synth_folder: "./runtime_data/dcase_synth/audio/train/synthetic21_train/soundscapes_16k"
+  synth_folder_44k: ""
+  synth_tsv: "./runtime_data/dcase_synth/metadata/train/synthetic21_train/soundscapes.tsv"
+  strong_folder: ""
+  strong_folder_44k: ""
+  strong_tsv: ""
+  weak_folder: ""
+  weak_folder_44k: ""
+  weak_tsv: ""
+  unlabeled_folder: ""
+  unlabeled_folder_44k: ""
+  synth_val_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
+  synth_val_folder_44k: ""
+  synth_val_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  synth_val_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
+  test_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
+  test_folder_44k: ""
+  test_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  test_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
+  eval_folder: ""
+  eval_folder_44k: ""
+  audio_max_len: 10
+  fs: 16000
+  net_subsample: 4
+opt:
+  lr: 0.00005
+feats:
+  n_mels: 128
+  n_filters: 2048
+  hop_length: 256
+  n_window: 2048
+  sample_rate: 16000
+  f_min: 0
+  f_max: 8000
+net:
+  dropout: 0.5
+  rnn_layers: 2
+  n_in_channel: 1
+  nclass: 10
+  attention: true
+  n_RNN_cell: 128
+  activation: glu
+  rnn_type: BGRU
+  kernel_size: [3, 3, 3, 3, 3, 3, 3]
+  padding: [1, 1, 1, 1, 1, 1, 1]
+  stride: [1, 1, 1, 1, 1, 1, 1]
+  nb_filters: [16, 32, 64, 128, 128, 128, 128]
+  pooling: [[2, 2], [2, 2], [1, 2], [1, 2], [1, 2], [1, 2], [1, 2]]
+  dropout_recurrent: 0
+model:
+  model_type: crnn_beats_residual_gated_fusion
+  encoder_type: crnn_beats_residual_gated_fusion
+  align:
+    method: interpolate
+    interpolate_mode: linear
+  fusion:
+    enabled: true
+    fusion_type: residual_gated
+    align_method: adaptive_avg
+    interpolate_mode: linear
+    fuse_dim: 256
+    norm_type: layernorm
+    gate_mode: channel
+    gate_hidden_dim: 256
+    gate_activation: gelu
+    gate_dropout: 0.5
+    use_post_fusion_proj: true
+    post_fusion_dim: 256
+    post_fusion_dropout: 0.5
+    use_alpha_scale: false
+    alpha_init: 1.0
+  beats:
+    checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
+    freeze: false
+    feature_layer: null
+    fbank_mean: 15.41663
+    fbank_std: 6.55582
+  decoder:
+    input_proj_dim: null
+    use_gru: true
+    hidden_dim: 128
+    rnn_layers: 2
+    dropout: 0.5
+    dropout_recurrent: 0
+    attention: true
+  teacher:
+    share_frozen_beats: false
+    share_frozen_encoder: false
