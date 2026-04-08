@@ -3,9 +3,9 @@ training:
   batch_size: 8
   batch_size_val: 8
   const_max: 0.5
-  n_epochs_warmup: 10
+  n_epochs_warmup: 20
   n_epochs: 120
-  early_stop_patience: 30
+  early_stop_patience: 20
   accumulate_batches: 1
   gradient_clip: 1.0
   median_window: 7
@@ -25,7 +25,7 @@ scaler:
   statistic: instance
   normtype: minmax
   dims: [1, 2]
-  savepath: ./scaler.ckpt
+  savepath: ./scaler_crnn_beats_resgate_from_full_ft_frozen_retrain_v2.ckpt
 data:
   synth_folder: "./runtime_data/dcase_synth/audio/train/synthetic21_train/soundscapes_16k"
   synth_folder_44k: ""
@@ -52,7 +52,7 @@ data:
   fs: 16000
   net_subsample: 4
 opt:
-  lr: 0.00005
+  lr: 0.00002
 feats:
   n_mels: 128
   n_filters: 2048
@@ -99,8 +99,8 @@ model:
     use_alpha_scale: true
     alpha_init: 0.2
   beats:
-    checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
-    freeze: false
+    checkpoint: "./pretrained/beats/BEATs_full_finetune_best_0_78.pt"
+    freeze: true
     feature_layer: null
     fbank_mean: 15.41663
     fbank_std: 6.55582
@@ -113,5 +113,5 @@ model:
     dropout_recurrent: 0
     attention: true
   teacher:
-    share_frozen_beats: false
-    share_frozen_encoder: false
+    share_frozen_beats: true
+    share_frozen_encoder: true

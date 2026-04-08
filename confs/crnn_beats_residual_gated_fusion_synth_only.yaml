@@ -1,16 +1,16 @@
 training:
   synth_only: true
-  batch_size: 16
-  batch_size_val: 8
-  const_max: 2
-  n_epochs_warmup: 50
-  num_workers: 8
-  n_epochs: 200
-  early_stop_patience: 200
+  batch_size: 64
+  batch_size_val: 64
+  const_max: 0.5
+  n_epochs_warmup: 10
+  num_workers: 16
+  n_epochs: 100
+  early_stop_patience: 20
   accumulate_batches: 1
   gradient_clip: 0.0
   median_window: 7
-  val_thresholds: [0.5]
+  val_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]
   n_test_thresholds: 50
   ema_factor: 0.999
   self_sup_loss: mse
@@ -18,7 +18,7 @@ training:
   validation_interval: 1
   weak_split: 0.9
   seed: 42
-  precision: 16-mixed
+  precision: 32
   mixup: soft
   obj_metric_synth_type: intersection
 scaler:
@@ -28,8 +28,8 @@ scaler:
   savepath: ./scaler.ckpt
 data:
   synth_folder: "./runtime_data/dcase_synth/audio/train/synthetic21_train/soundscapes_16k"
-  synth_folder_44k: "/mnt/d/Downloads/Compressed/dcase_synth/audio/train/synthetic21_train/soundscapes"
-  synth_tsv: "/mnt/d/Downloads/Compressed/dcase_synth/metadata/train/synthetic21_train/soundscapes.tsv"
+  synth_folder_44k: ""
+  synth_tsv: "./runtime_data/dcase_synth/metadata/train/synthetic21_train/soundscapes.tsv"
   strong_folder: ""
   strong_folder_44k: ""
   strong_tsv: ""
@@ -39,12 +39,12 @@ data:
   unlabeled_folder: ""
   unlabeled_folder_44k: ""
   synth_val_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
-  synth_val_folder_44k: "/mnt/d/Downloads/Compressed/dcase_synth/audio/validation/synthetic21_validation/soundscapes"
-  synth_val_tsv: "/mnt/d/Downloads/Compressed/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  synth_val_folder_44k: ""
+  synth_val_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
   synth_val_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
   test_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
-  test_folder_44k: "/mnt/d/Downloads/Compressed/dcase_synth/audio/validation/synthetic21_validation/soundscapes"
-  test_tsv: "/mnt/d/Downloads/Compressed/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  test_folder_44k: ""
+  test_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
   test_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
   eval_folder: ""
   eval_folder_44k: ""
@@ -52,7 +52,7 @@ data:
   fs: 16000
   net_subsample: 4
 opt:
-  lr: 0.001
+  lr: 0.000005
 feats:
   n_mels: 128
   n_filters: 2048
@@ -92,18 +92,23 @@ model:
     gate_mode: channel
     gate_hidden_dim: 256
     gate_activation: gelu
-    gate_dropout: 0.5
+    gate_dropout: 0.3
     use_post_fusion_proj: true
     post_fusion_dim: 256
-    post_fusion_dropout: 0.5
-    use_alpha_scale: false
-    alpha_init: 1.0
+    post_fusion_dropout: 0.3
+    use_alpha_scale: true
+    alpha_init: 0.2
+    load_beats_decoder_head: true
+    beats_decoder_head_ckpt: "./exp/unified_beats_synth_only_a800_finetune/version_5/epoch=55-step=8791.ckpt"
   beats:
-    checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
-    freeze: true
+    checkpoint: "./pretrained/beats/BEATs_full_finetune_best_0_78.pt"
+    freeze: false
     feature_layer: null
     fbank_mean: 15.41663
     fbank_std: 6.55582
+  crnn_warmstart:
+    enable: true
+    checkpoint: "./pretrained/crnn/crnn_best.pt"
   decoder:
     input_proj_dim: null
     use_gru: true
@@ -113,5 +118,5 @@ model:
     dropout_recurrent: 0
     attention: true
   teacher:
-    share_frozen_beats: true
+    share_frozen_beats: false
     share_frozen_encoder: false

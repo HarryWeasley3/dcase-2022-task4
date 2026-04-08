@@ -1,17 +1,15 @@
 from copy import deepcopy
 
+import torch
 import torch.nn as nn
 
 
-class CRNNBEATsResidualGatedFusionModel(nn.Module):
-    """Residual gated fusion with a BEATs main path and CRNN correction branch.
+class CRNNBEATsLateFusionModel(nn.Module):
+    """Paper-style late fusion:
 
-    Data flow:
-        waveform -> CRNN CNN branch
-                -> BEATs branch -> align to CNN time
-                -> projection + per-branch LayerNorm
-                -> gate([cnn, beats]) and BEATs-main residual fusion
-                -> shared BiGRU / strong-weak heads
+    waveform -> CRNN CNN branch
+            -> BEATs branch -> align to CNN time
+            -> concat -> Merge MLP -> shared BiGRU/classifier
     """
 
     def __init__(
@@ -19,20 +17,31 @@ class CRNNBEATsResidualGatedFusionModel(nn.Module):
         crnn_encoder,
         beats_encoder,
         fusion_aligner,
-        fusion_block,
+        merge_mlp,
         decoder,
         label_aligner,
+        fusion_type="concat",
         build_config=None,
     ):
         super().__init__()
         self.crnn_encoder = crnn_encoder
         self.beats_encoder = beats_encoder
         self.fusion_aligner = fusion_aligner
-        self.fusion_block = fusion_block
+        self.merge_mlp = merge_mlp
         self.decoder = decoder
         self.label_aligner = label_aligner
-        self.encoder_type = "crnn_beats_residual_gated_fusion"
+        self.fusion_type = fusion_type
+        self.encoder_type = "crnn_beats_late_fusion"
         self.build_config = deepcopy(build_config) if build_config is not None else None
+
+        if fusion_type == "add":
+            beats_dim = beats_encoder.output_dim
+            cnn_dim = crnn_encoder.output_dim
+            self.add_proj = (
+                nn.Identity() if beats_dim == cnn_dim else nn.Linear(beats_dim, cnn_dim)
+            )
+        else:
+            self.add_proj = None
 
     @property
     def needs_input_scaler(self):
@@ -46,6 +55,7 @@ class CRNNBEATsResidualGatedFusionModel(nn.Module):
         self.crnn_encoder.set_input_scaler(scaler)
 
     def prepare_inputs(self, audio):
+        # Only the CRNN branch needs the mel frontend/scaler statistics.
         return self.crnn_encoder.prepare_inputs(audio)
 
     def make_teacher_copy(self, share_encoder_if_frozen=True):
@@ -70,6 +80,17 @@ class CRNNBEATsResidualGatedFusionModel(nn.Module):
 
         return teacher
 
+    def _fuse(self, cnn_features, beats_features):
+        beats_aligned = self.fusion_aligner(beats_features, cnn_features)
+        if self.fusion_type == "concat":
+            fused = torch.cat([cnn_features, beats_aligned], dim=-1)
+        elif self.fusion_type == "add":
+            fused = cnn_features + self.add_proj(beats_aligned)
+        else:
+            raise ValueError(f"Unsupported fusion_type: {self.fusion_type}")
+        merged = self.merge_mlp(fused)
+        return beats_aligned, fused, merged
+
     def forward(
         self,
         audio,
@@ -82,29 +103,23 @@ class CRNNBEATsResidualGatedFusionModel(nn.Module):
 
         cnn_features = cnn_outputs["sequence_features"]
         beats_features = beats_outputs["sequence_features"]
-        beats_aligned = self.fusion_aligner(beats_features, cnn_features)
-        fusion_outputs = self.fusion_block(cnn_features, beats_aligned)
-
-        decoder_inputs = self.label_aligner(
-            fusion_outputs["fused_output"], target_frame_len
+        beats_aligned, fused_features, merged_features = self._fuse(
+            cnn_features, beats_features
         )
+
+        decoder_inputs = self.label_aligner(merged_features, target_frame_len)
         decoder_outputs = self.decoder(decoder_inputs)
 
         outputs = {
             "strong_preds": decoder_outputs["strong_preds"],
             "weak_preds": decoder_outputs["weak_preds"],
             "strong_logits": decoder_outputs["strong_logits"],
-            "encoder_sequence_features": fusion_outputs["fused_output"],
+            "encoder_sequence_features": merged_features,
             "aligned_sequence_features": decoder_inputs,
             "cnn_sequence_features": cnn_features,
             "beats_sequence_features": beats_features,
             "beats_aligned_features": beats_aligned,
-            "cnn_projected_features": fusion_outputs["cnn_projected"],
-            "beats_projected_features": fusion_outputs["beats_projected"],
-            "cnn_normalized_features": fusion_outputs["cnn_normalized"],
-            "beats_normalized_features": fusion_outputs["beats_normalized"],
-            "fusion_gate": fusion_outputs["gate"],
-            "fused_sequence_features": fusion_outputs["fused"],
+            "fused_sequence_features": fused_features,
         }
 
         if return_intermediates:

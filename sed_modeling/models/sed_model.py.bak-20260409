@@ -1,7 +1,5 @@
 from copy import deepcopy
-from pathlib import Path
 
-import torch
 import torch.nn as nn
 
 from sed_modeling.decoders import SEDDecoder
@@ -95,17 +93,11 @@ def resolve_model_config(config):
             "post_fusion_dropout": net_cfg.get("dropout", 0.5),
             "use_alpha_scale": False,
             "alpha_init": 1.0,
-            "load_beats_decoder_head": False,
-            "beats_decoder_head_ckpt": "",
         },
         "teacher": {
             "share_frozen_encoder": True,
             "share_frozen_beats": True,
             "share_frozen_wavlm": True,
-        },
-        "crnn_warmstart": {
-            "enable": False,
-            "checkpoint": "",
         },
     }
 
@@ -113,228 +105,6 @@ def resolve_model_config(config):
         _deep_update(model_cfg, config["model"])
 
     return model_cfg
-
-
-def _load_late_fusion_decoder_head_warmstart(model, fusion_cfg):
-    if not fusion_cfg.get("load_beats_decoder_head", False):
-        return
-
-    ckpt_path = fusion_cfg.get("beats_decoder_head_ckpt", "")
-    if not ckpt_path:
-        print(
-            "[late-fusion warm-start] enabled, but "
-            "model.fusion.beats_decoder_head_ckpt is empty; skipping."
-        )
-        return
-
-    ckpt_path = Path(ckpt_path).expanduser()
-    if not ckpt_path.is_file():
-        print(
-            f"[late-fusion warm-start] checkpoint not found: {ckpt_path}; skipping."
-        )
-        return
-
-    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
-    source_state = checkpoint.get("state_dict", checkpoint)
-    target_state = model.state_dict()
-
-    source_prefix = None
-    for candidate in ("sed_student.decoder.", "decoder."):
-        if any(k.startswith(candidate) for k in source_state):
-            source_prefix = candidate
-            break
-
-    if source_prefix is None:
-        print(
-            "[late-fusion warm-start] no compatible decoder prefix found in "
-            f"{ckpt_path}; checked sed_student.decoder. and decoder.; skipping."
-        )
-        return
-
-    load_state = {}
-    loaded_keys = []
-    missing_source_keys = []
-    mismatched_keys = []
-
-    # The late-fusion decoder shares the BiGRU + strong/weak heads with the
-    # BEATs-only model, while merge MLP remains late-fusion-specific.
-    target_prefixes = (
-        "decoder.temporal.",
-        "decoder.strong_head.",
-        "decoder.attention_head.",
-    )
-    for target_key, target_tensor in target_state.items():
-        if not any(target_key.startswith(prefix) for prefix in target_prefixes):
-            continue
-
-        source_key = f"{source_prefix}{target_key[len('decoder.'):]}"
-        if source_key not in source_state:
-            missing_source_keys.append((target_key, source_key))
-            continue
-
-        source_tensor = source_state[source_key]
-        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
-            mismatched_keys.append(
-                (target_key, source_key, tuple(target_tensor.shape), tuple(source_tensor.shape))
-            )
-            continue
-
-        load_state[target_key] = source_tensor
-        loaded_keys.append((target_key, source_key))
-
-    skipped_target_keys = [
-        key for key in target_state if key.startswith("decoder.input_proj.")
-    ]
-
-    missing_keys, unexpected_keys = model.load_state_dict(load_state, strict=False)
-    relevant_missing_keys = [
-        key
-        for key in missing_keys
-        if any(key.startswith(prefix) for prefix in target_prefixes)
-    ]
-
-    print(
-        "[late-fusion warm-start] loaded decoder/head from "
-        f"{ckpt_path} using prefix {source_prefix}"
-    )
-    print(
-        "[late-fusion warm-start] loaded "
-        f"{len(loaded_keys)} keys; missing source={len(missing_source_keys)}; "
-        f"shape mismatch={len(mismatched_keys)}"
-    )
-    for target_key, source_key in loaded_keys:
-        print(f"  loaded: {source_key} -> {target_key}")
-    for target_key in skipped_target_keys:
-        print(
-            f"  skipped target-only module: {target_key} "
-            "(late-fusion uses merge MLP output, so decoder.input_proj stays untouched)"
-        )
-    for target_key, source_key in missing_source_keys:
-        print(f"  missing source: {source_key} for target {target_key}")
-    for target_key, source_key, target_shape, source_shape in mismatched_keys:
-        print(
-            "  shape mismatch: "
-            f"{source_key} {source_shape} -> {target_key} {target_shape}"
-        )
-    if relevant_missing_keys:
-        print(
-            "[late-fusion warm-start] load_state_dict missing keys "
-            f"(within decoder/head scope): {relevant_missing_keys}"
-        )
-    if unexpected_keys:
-        print(
-            "[late-fusion warm-start] load_state_dict unexpected keys: "
-            f"{unexpected_keys}"
-        )
-
-
-def _load_crnn_encoder_warmstart(model, model_cfg):
-    crnn_cfg = model_cfg.get("crnn_warmstart", {})
-    if not crnn_cfg.get("enable", False):
-        return
-
-    ckpt_path = crnn_cfg.get("checkpoint", "")
-    if not ckpt_path:
-        print(
-            "[crnn warm-start] enabled, but model.crnn_warmstart.checkpoint is empty; "
-            "skipping."
-        )
-        return
-
-    ckpt_path = Path(ckpt_path).expanduser()
-    if not ckpt_path.is_file():
-        print(f"[crnn warm-start] checkpoint not found: {ckpt_path}; skipping.")
-        return
-
-    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
-    source_state = checkpoint.get("state_dict", checkpoint)
-    target_state = model.state_dict()
-
-    source_prefix = None
-    source_target_prefix = None
-    for candidate, target_prefix in (
-        ("crnn_encoder.cnn.", "crnn_encoder.cnn."),
-        ("sed_student.cnn.", "crnn_encoder.cnn."),
-        ("cnn.", "crnn_encoder.cnn."),
-    ):
-        if any(k.startswith(candidate) for k in source_state):
-            source_prefix = candidate
-            source_target_prefix = target_prefix
-            break
-
-    if source_prefix is None:
-        print(
-            "[crnn warm-start] no compatible CRNN prefix found in "
-            f"{ckpt_path}; checked crnn_encoder.cnn., sed_student.cnn., and cnn.; skipping."
-        )
-        return
-
-    load_state = {}
-    loaded_keys = []
-    missing_source_keys = []
-    mismatched_keys = []
-
-    for target_key, target_tensor in target_state.items():
-        if not target_key.startswith(source_target_prefix):
-            continue
-
-        source_key = f"{source_prefix}{target_key[len(source_target_prefix):]}"
-        if source_key not in source_state:
-            missing_source_keys.append((target_key, source_key))
-            continue
-
-        source_tensor = source_state[source_key]
-        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
-            mismatched_keys.append(
-                (target_key, source_key, tuple(target_tensor.shape), tuple(source_tensor.shape))
-            )
-            continue
-
-        load_state[target_key] = source_tensor
-        loaded_keys.append((target_key, source_key))
-
-    skipped_target_keys = [
-        key for key in target_state if key.startswith("crnn_encoder.") and key not in load_state
-    ]
-
-    missing_keys, unexpected_keys = model.load_state_dict(load_state, strict=False)
-    relevant_missing_keys = [
-        key for key in missing_keys if key.startswith(source_target_prefix)
-    ]
-
-    print(
-        "[crnn warm-start] loaded CRNN encoder from "
-        f"{ckpt_path} using prefix {source_prefix}"
-    )
-    print(
-        "[crnn warm-start] loaded "
-        f"{len(loaded_keys)} keys; missing source={len(missing_source_keys)}; "
-        f"shape mismatch={len(mismatched_keys)}"
-    )
-    for target_key, source_key in loaded_keys:
-        print(f"  loaded: {source_key} -> {target_key}")
-    for target_key in skipped_target_keys:
-        print(
-            f"  skipped target-only module: {target_key} "
-            "(frontend buffers / non-CRNN-CNN modules stay on current model defaults)"
-        )
-    for target_key, source_key in missing_source_keys:
-        print(f"  missing source: {source_key} for target {target_key}")
-    for target_key, source_key, target_shape, source_shape in mismatched_keys:
-        print(
-            "  shape mismatch: "
-            f"{source_key} {source_shape} -> {target_key} {target_shape}"
-        )
-    if relevant_missing_keys:
-        print(
-            "[crnn warm-start] load_state_dict missing keys "
-            f"(within CRNN encoder scope): {relevant_missing_keys}"
-        )
-    if unexpected_keys:
-        print(
-            "[crnn warm-start] load_state_dict unexpected keys: "
-            f"{unexpected_keys}"
-        )
 
 
 class SEDModel(nn.Module):
@@ -447,7 +217,7 @@ def build_sed_model(config):
             n_classes=num_classes,
             **model_cfg["decoder"],
         )
-        model = CRNNBEATsLateFusionModel(
+        return CRNNBEATsLateFusionModel(
             crnn_encoder=crnn_encoder,
             beats_encoder=beats_encoder,
             fusion_aligner=fusion_aligner,
@@ -455,12 +225,8 @@ def build_sed_model(config):
             decoder=decoder,
             label_aligner=label_aligner,
             fusion_type=fusion_type,
-            use_branch_layernorm=fusion_cfg.get("use_layernorm", False),
             build_config=config,
         )
-        _load_crnn_encoder_warmstart(model, model_cfg)
-        _load_late_fusion_decoder_head_warmstart(model, fusion_cfg)
-        return model
 
     if model_type == "crnn_beats_residual_gated_fusion":
         crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
@@ -497,7 +263,7 @@ def build_sed_model(config):
             n_classes=num_classes,
             **model_cfg["decoder"],
         )
-        model = CRNNBEATsResidualGatedFusionModel(
+        return CRNNBEATsResidualGatedFusionModel(
             crnn_encoder=crnn_encoder,
             beats_encoder=beats_encoder,
             fusion_aligner=fusion_aligner,
@@ -506,8 +272,6 @@ def build_sed_model(config):
             label_aligner=label_aligner,
             build_config=config,
         )
-        _load_crnn_encoder_warmstart(model, model_cfg)
-        return model
 
     if model_type == "crnn_wavlm_residual_gated_fusion":
         crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])

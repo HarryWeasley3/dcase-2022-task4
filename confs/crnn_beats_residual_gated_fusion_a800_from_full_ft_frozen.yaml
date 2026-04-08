@@ -25,7 +25,7 @@ scaler:
   statistic: instance
   normtype: minmax
   dims: [1, 2]
-  savepath: ./scaler.ckpt
+  savepath: ./scaler_crnn_beats_resgate_from_full_ft_frozen.ckpt
 data:
   synth_folder: "./runtime_data/dcase_synth/audio/train/synthetic21_train/soundscapes_16k"
   synth_folder_44k: ""
@@ -99,8 +99,8 @@ model:
     use_alpha_scale: true
     alpha_init: 0.2
   beats:
-    checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
-    freeze: false
+    checkpoint: "./pretrained/beats/BEATs_full_finetune_from_version5_epoch55_step8791.pt"
+    freeze: true
     feature_layer: null
     fbank_mean: 15.41663
     fbank_std: 6.55582
@@ -113,5 +113,5 @@ model:
     dropout_recurrent: 0
     attention: true
   teacher:
-    share_frozen_beats: false
-    share_frozen_encoder: false
+    share_frozen_beats: true
+    share_frozen_encoder: true

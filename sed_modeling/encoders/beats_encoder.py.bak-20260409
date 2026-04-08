@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -12,14 +11,6 @@ def _torch_load_compat(path, map_location="cpu"):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
-
-
-def _disabled_autocast_context(device_type):
-    if device_type == "cuda":
-        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-            return torch.amp.autocast("cuda", enabled=False)
-        return torch.cuda.amp.autocast(enabled=False)
-    return nullcontext()
 
 
 class BEATsEncoder(nn.Module):
@@ -96,7 +87,11 @@ class BEATsEncoder(nn.Module):
 
     def forward(self, audio, padding_mask=None):
         if self.is_frozen:
-            autocast_context = _disabled_autocast_context(audio.device.type)
+            autocast_context = (
+                torch.amp.autocast("cuda", enabled=False)
+                if audio.device.type == "cuda"
+                else torch.autocast("cpu", enabled=False)
+            )
             with torch.no_grad(), autocast_context:
                 return self._extract_sequence_features(audio, padding_mask=padding_mask)
         return self._extract_sequence_features(audio, padding_mask=padding_mask)
