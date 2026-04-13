@@ -1,6 +1,8 @@
 from .models import (
     CRNNBEATsLateFusionModel,
     CRNNBEATsResidualGatedFusionModel,
+    CRNNBEATsWavLMLateFusionModel,
+    CRNNBEATsWavLMResidualGatedFusionModel,
     CRNNWavLMLateFusionModel,
     CRNNWavLMResidualGatedFusionModel,
     SEDModel,
@@ -12,6 +14,8 @@ __all__ = [
     "SEDModel",
     "CRNNBEATsLateFusionModel",
     "CRNNBEATsResidualGatedFusionModel",
+    "CRNNBEATsWavLMLateFusionModel",
+    "CRNNBEATsWavLMResidualGatedFusionModel",
     "CRNNWavLMLateFusionModel",
     "CRNNWavLMResidualGatedFusionModel",
     "build_sed_model",

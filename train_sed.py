@@ -3,6 +3,7 @@ import inspect
 import os
 import random
 import warnings
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,63 @@ def _torch_load_compat(path, map_location=None):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def _deep_update(base, override):
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _resolve_profiles(config):
+    resolved = deepcopy(config)
+    top_level_profiles = resolved.pop("profiles", None)
+
+    experiment_cfg = resolved.get("experiment", {})
+    experiment_profiles = None
+    selected_profile = None
+    if isinstance(experiment_cfg, dict):
+        experiment_profiles = experiment_cfg.pop("profiles", None)
+        selected_profile = experiment_cfg.get("profile")
+
+    if selected_profile is None:
+        selected_profile = resolved.pop("profile", None)
+
+    profiles = experiment_profiles or top_level_profiles or {}
+    if selected_profile is None:
+        return resolved
+
+    if selected_profile not in profiles:
+        raise KeyError(
+            f"Unknown config profile '{selected_profile}'. "
+            f"Available profiles: {sorted(profiles.keys())}"
+        )
+
+    _deep_update(resolved, deepcopy(profiles[selected_profile]))
+    resolved.setdefault("experiment", {})
+    resolved["experiment"]["profile"] = selected_profile
+    return resolved
+
+
+def load_experiment_config(conf_file):
+    with open(conf_file, "r") as f:
+        configs = yaml.safe_load(f) or {}
+    return _resolve_profiles(configs)
+
+
+class _NoOpScheduler:
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.step_num = 0
+
+    def _get_scaling_factor(self):
+        return 1.0
+
+    def step(self):
+        self.step_num += 1
 
 
 def _build_trainer_kwargs(
@@ -366,6 +424,8 @@ def single_run(
                 total_steps,
                 min_lr=config["opt"].get("min_lr", 1e-6),
             )
+        elif scheduler_name in ("none", "disabled", False):
+            scheduler_impl = _NoOpScheduler(opt)
         else:
             raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
@@ -527,8 +587,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    with open(args.conf_file, "r") as f:
-        configs = yaml.safe_load(f)
+    configs = load_experiment_config(args.conf_file)
 
     configs.setdefault("training", {})
     configs["training"]["synth_only"] = args.synth_only or configs["training"].get(
