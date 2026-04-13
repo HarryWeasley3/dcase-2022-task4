@@ -15,6 +15,7 @@ from sed_modeling.modules import (
 
 from .crnn_beats_late_fusion import CRNNBEATsLateFusionModel
 from .crnn_beats_residual_gated_fusion import CRNNBEATsResidualGatedFusionModel
+from .crnn_wavlm_late_fusion import CRNNWavLMLateFusionModel
 from .crnn_wavlm_residual_gated_fusion import CRNNWavLMResidualGatedFusionModel
 
 
@@ -504,6 +505,49 @@ def build_sed_model(config):
             fusion_block=fusion_block,
             decoder=decoder,
             label_aligner=label_aligner,
+            build_config=config,
+        )
+        _load_crnn_encoder_warmstart(model, model_cfg)
+        return model
+
+    if model_type == "crnn_wavlm_late_fusion":
+        crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
+        wavlm_encoder = WavLMEncoder(**model_cfg["wavlm"])
+        fusion_cfg = model_cfg["fusion"]
+        fusion_aligner = FusionTimeAligner(
+            method=fusion_cfg.get("align_method", "adaptive_avg"),
+            interpolate_mode=fusion_cfg.get("interpolate_mode", "linear"),
+        )
+        fusion_type = fusion_cfg.get("fusion_type", "concat").lower()
+        if fusion_type == "concat":
+            fusion_input_dim = crnn_encoder.output_dim + wavlm_encoder.output_dim
+        elif fusion_type == "add":
+            fusion_input_dim = crnn_encoder.output_dim
+        else:
+            raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+
+        merge_mlp = MergeMLP(
+            input_dim=fusion_input_dim,
+            output_dim=fusion_cfg.get("merge_mlp_dim", 256),
+            activation=fusion_cfg.get("merge_activation", "gelu"),
+            dropout=fusion_cfg.get("merge_dropout", 0.5),
+            use_layernorm=fusion_cfg.get("use_layernorm", False),
+        )
+        label_aligner = TimeAligner(**model_cfg["align"])
+        decoder = SEDDecoder(
+            input_dim=fusion_cfg.get("merge_mlp_dim", 256),
+            n_classes=num_classes,
+            **model_cfg["decoder"],
+        )
+        model = CRNNWavLMLateFusionModel(
+            crnn_encoder=crnn_encoder,
+            wavlm_encoder=wavlm_encoder,
+            fusion_aligner=fusion_aligner,
+            merge_mlp=merge_mlp,
+            decoder=decoder,
+            label_aligner=label_aligner,
+            fusion_type=fusion_type,
+            use_branch_layernorm=fusion_cfg.get("use_layernorm", False),
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
