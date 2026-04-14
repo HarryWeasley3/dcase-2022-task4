@@ -3,9 +3,9 @@ profile: server_a800
 profiles:
   server_a800:
     training:
-      batch_size: 16
-      batch_size_val: 16
-      num_workers: 8
+      batch_size: 8
+      batch_size_val: 8
+      num_workers: 4
       accumulate_batches: 1
       n_epochs_warmup: 10
       n_epochs: 120
@@ -61,7 +61,7 @@ data:
   net_subsample: 4
 
 opt:
-  lr: 0.00002
+  lr: 0.000015
   scheduler: warmup_cosine
   min_lr: 0.000001
 
@@ -100,29 +100,29 @@ model:
       enabled: true
       train: true
       warmstart:
-        enable: false
+        enable: true
         checkpoint: "./pretrained/crnn/crnn_best.pt"
     beats:
       enabled: true
       pretrained_checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
-      freeze: true
+      freeze: false
       feature_layer: null
       fbank_mean: 15.41663
       fbank_std: 6.55582
       warmstart:
-        enable: false
+        enable: true
         checkpoint: "./pretrained/beats/BEATs_full_finetune_best_0_78.pt"
     wavlm:
-      enabled: false
+      enabled: true
       pretrained_checkpoint: "./pretrained/wavlm/WavLM-Base+.pt"
       bundle_name: "WAVLM_BASE_PLUS"
-      freeze: true
+      freeze: false
       output_layer: null
       use_bundle_weights: true
       normalize_waveform: false
       warmstart:
-        enable: false
-        checkpoint: "./pretrained/wavlm/WavLM_full_finetune_best.pt"
+        enable: true
+        checkpoint: "./pretrained/wavlm/WavLM_full_finetune_best_0_65.pt"
 
   fusion:
     strategy: late
@@ -160,10 +160,10 @@ model:
     attention: true
 
   decoder_warmstart:
-    enable: false
+    enable: true
     checkpoint: "./exp/unified_beats_synth_only_a800_finetune/version_5/epoch=55-step=8791.ckpt"
 
   teacher:
     share_frozen_encoder: false
-    share_frozen_beats: true
-    share_frozen_wavlm: true
+    share_frozen_beats: false
+    share_frozen_wavlm: false
