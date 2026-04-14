@@ -58,7 +58,7 @@ def build_parser():
     )
     parser.add_argument(
         "--out",
-        default="pretrained/wavlm/WavLM_full_finetune_epoch49_step31249.pt",
+        default="pretrained/wavlm/WavLM_full_finetune_best_0_65.pt",
         help="导出的 WavLM 权重路径。",
     )
     return parser
