@@ -157,7 +157,9 @@ class SEDTask4(pl.LightningModule):
 
     def _disable_autocast_context(self):
         if self.device.type == "cuda":
-            return torch.amp.autocast("cuda", enabled=False)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+                return torch.amp.autocast("cuda", enabled=False)
+            return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
     def _sanitize_probabilities(self, preds):
@@ -177,6 +179,37 @@ class SEDTask4(pl.LightningModule):
             safe_preds = self._sanitize_probabilities(preds)
             safe_targets = self._sanitize_probabilities(targets)
             return self.selfsup_loss(safe_preds, safe_targets)
+
+    def _select_validation_threshold(self, threshold_to_df, preferred=0.5):
+        """Resolve a concrete threshold key while keeping current behavior.
+
+        Today we still default to the standard 0.5 operating point. Centralizing
+        the lookup here keeps the validation path ready for future
+        multi-threshold aggregation without rewriting the epoch-end flow.
+        """
+        thresholds = list(threshold_to_df.keys())
+        if not thresholds:
+            raise ValueError("Validation threshold buffer is empty.")
+        if preferred in threshold_to_df:
+            return preferred
+        return min(thresholds, key=lambda threshold: abs(float(threshold) - preferred))
+
+    def _compute_synth_obj_metric(
+        self,
+        intersection_f1_macro_student,
+        synth_student_event_macro,
+    ):
+        """Return the synth-side objective metric for checkpoint selection."""
+        obj_metric_synth_type = self.hparams["training"].get("obj_metric_synth_type")
+        if obj_metric_synth_type is None:
+            return intersection_f1_macro_student
+        if obj_metric_synth_type == "event":
+            return synth_student_event_macro
+        if obj_metric_synth_type == "intersection":
+            return intersection_f1_macro_student
+        raise NotImplementedError(
+            f"obj_metric_synth_type: {obj_metric_synth_type} not implemented."
+        )
 
     def on_train_start(self) -> None:
         os.makedirs(os.path.join(self.exp_dir, "training_codecarbon"), exist_ok=True)
@@ -558,8 +591,12 @@ class SEDTask4(pl.LightningModule):
             self.hparams["data"]["synth_val_dur"],
         )
 
+        default_event_threshold = self._select_validation_threshold(
+            self.val_buffer_student_synth
+        )
+
         synth_student_event_macro = log_sedeval_metrics(
-            self.val_buffer_student_synth[0.5],
+            self.val_buffer_student_synth[default_event_threshold],
             self.hparams["data"]["synth_val_tsv"],
         )[0]
 
@@ -570,21 +607,14 @@ class SEDTask4(pl.LightningModule):
         )
 
         synth_teacher_event_macro = log_sedeval_metrics(
-            self.val_buffer_teacher_synth[0.5],
+            self.val_buffer_teacher_synth[default_event_threshold],
             self.hparams["data"]["synth_val_tsv"],
         )[0]
 
-        obj_metric_synth_type = self.hparams["training"].get("obj_metric_synth_type")
-        if obj_metric_synth_type is None:
-            synth_metric = intersection_f1_macro_student
-        elif obj_metric_synth_type == "event":
-            synth_metric = synth_student_event_macro
-        elif obj_metric_synth_type == "intersection":
-            synth_metric = intersection_f1_macro_student
-        else:
-            raise NotImplementedError(
-                f"obj_metric_synth_type: {obj_metric_synth_type} not implemented."
-            )
+        synth_metric = self._compute_synth_obj_metric(
+            intersection_f1_macro_student,
+            synth_student_event_macro,
+        )
 
         if self.synth_only or not self.has_weak_validation:
             obj_metric = torch.tensor(synth_metric, device=self.device)

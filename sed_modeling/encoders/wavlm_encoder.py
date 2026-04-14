@@ -6,6 +6,13 @@ import torch.nn.functional as F
 import torchaudio
 
 
+def _torch_load_compat(path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class WavLMEncoder(nn.Module):
     """WavLM feature extractor for the unified SED encoder-decoder framework.
 
@@ -91,7 +98,7 @@ class WavLMEncoder(nn.Module):
         )
 
     def _load_checkpoint(self, model, checkpoint_path):
-        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state = _torch_load_compat(checkpoint_path, map_location="cpu")
         state_dict = self._extract_state_dict(state)
         try:
             model.load_state_dict(state_dict, strict=True)

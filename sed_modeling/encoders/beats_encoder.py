@@ -1,9 +1,25 @@
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 from sed_modeling.third_party.beats import BEATs, BEATsConfig
+
+
+def _torch_load_compat(path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _disabled_autocast_context(device_type):
+    if device_type == "cuda":
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast("cuda", enabled=False)
+        return torch.cuda.amp.autocast(enabled=False)
+    return nullcontext()
 
 
 class BEATsEncoder(nn.Module):
@@ -16,6 +32,8 @@ class BEATsEncoder(nn.Module):
         feature_layer=None,
         fbank_mean=15.41663,
         fbank_std=6.55582,
+        load_branch_weights=False,
+        branch_checkpoint="",
     ):
         super().__init__()
         checkpoint_path = Path(checkpoint) if checkpoint else None
@@ -24,10 +42,19 @@ class BEATsEncoder(nn.Module):
                 "BEATs encoder requires a valid checkpoint path in model.beats.checkpoint."
             )
 
-        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state = _torch_load_compat(checkpoint_path, map_location="cpu")
         cfg = BEATsConfig(state["cfg"])
         self.beats = BEATs(cfg)
         self.beats.load_state_dict(state["model"])
+
+        if load_branch_weights:
+            branch_checkpoint_path = Path(branch_checkpoint) if branch_checkpoint else None
+            if branch_checkpoint_path is None or not branch_checkpoint_path.exists():
+                raise FileNotFoundError(
+                    "BEATs branch warm-start requires a valid model.beats.branch_checkpoint "
+                    "when model.beats.load_branch_weights is true."
+                )
+            self._load_branch_weights(branch_checkpoint_path)
 
         self.feature_layer = feature_layer
         self.fbank_mean = fbank_mean
@@ -40,6 +67,71 @@ class BEATsEncoder(nn.Module):
             for param in self.beats.parameters():
                 param.requires_grad = False
             self.beats.eval()
+
+    def _load_branch_weights(self, checkpoint_path):
+        checkpoint = _torch_load_compat(checkpoint_path, map_location="cpu")
+        source_prefix = None
+
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model"), dict):
+            source_state = checkpoint["model"]
+            source_prefix = "model"
+        else:
+            source_state = checkpoint.get("state_dict", checkpoint)
+            for candidate in (
+                "beats_encoder.beats.",
+                "sed_student.beats_encoder.beats.",
+                "encoder.beats.",
+                "sed_student.encoder.beats.",
+            ):
+                if any(key.startswith(candidate) for key in source_state):
+                    source_prefix = candidate
+                    source_state = {
+                        key[len(candidate) :]: value
+                        for key, value in source_state.items()
+                        if key.startswith(candidate)
+                    }
+                    break
+
+        target_state = self.beats.state_dict()
+        load_state = {}
+        missing_source_keys = []
+        mismatched_keys = []
+
+        for target_key, target_tensor in target_state.items():
+            if target_key not in source_state:
+                missing_source_keys.append(target_key)
+                continue
+
+            source_tensor = source_state[target_key]
+            if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+                mismatched_keys.append(
+                    (target_key, tuple(target_tensor.shape), tuple(source_tensor.shape))
+                )
+                continue
+
+            load_state[target_key] = source_tensor
+
+        incompatible = self.beats.load_state_dict(load_state, strict=False)
+        print(
+            "[beats branch warm-start] loaded BEATs branch from "
+            f"{checkpoint_path} using prefix {source_prefix!r} "
+            f"(loaded={len(load_state)}, missing_source={len(missing_source_keys)}, "
+            f"shape_mismatch={len(mismatched_keys)})"
+        )
+        if missing_source_keys:
+            print("[beats branch warm-start] missing source keys:", missing_source_keys)
+        if mismatched_keys:
+            print("[beats branch warm-start] shape mismatch:", mismatched_keys)
+        if incompatible.missing_keys:
+            print(
+                "[beats branch warm-start] target missing keys:",
+                incompatible.missing_keys,
+            )
+        if incompatible.unexpected_keys:
+            print(
+                "[beats branch warm-start] unexpected keys:",
+                incompatible.unexpected_keys,
+            )
 
     def set_input_scaler(self, scaler):
         del scaler
@@ -80,11 +172,7 @@ class BEATsEncoder(nn.Module):
 
     def forward(self, audio, padding_mask=None):
         if self.is_frozen:
-            autocast_context = (
-                torch.amp.autocast("cuda", enabled=False)
-                if audio.device.type == "cuda"
-                else torch.autocast("cpu", enabled=False)
-            )
+            autocast_context = _disabled_autocast_context(audio.device.type)
             with torch.no_grad(), autocast_context:
                 return self._extract_sequence_features(audio, padding_mask=padding_mask)
         return self._extract_sequence_features(audio, padding_mask=padding_mask)

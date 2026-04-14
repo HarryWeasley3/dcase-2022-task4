@@ -21,6 +21,7 @@ class CRNNBEATsLateFusionModel(nn.Module):
         decoder,
         label_aligner,
         fusion_type="concat",
+        use_branch_layernorm=False,
         build_config=None,
     ):
         super().__init__()
@@ -32,7 +33,17 @@ class CRNNBEATsLateFusionModel(nn.Module):
         self.label_aligner = label_aligner
         self.fusion_type = fusion_type
         self.encoder_type = "crnn_beats_late_fusion"
+        self.use_branch_layernorm = use_branch_layernorm
         self.build_config = deepcopy(build_config) if build_config is not None else None
+
+        if use_branch_layernorm:
+            # Normalize each branch before late fusion so the merge MLP does not
+            # immediately inherit the large BEATs-vs-CRNN scale mismatch.
+            self.cnn_pre_fusion_norm = nn.LayerNorm(crnn_encoder.output_dim)
+            self.beats_pre_fusion_norm = nn.LayerNorm(beats_encoder.output_dim)
+        else:
+            self.cnn_pre_fusion_norm = nn.Identity()
+            self.beats_pre_fusion_norm = nn.Identity()
 
         if fusion_type == "add":
             beats_dim = beats_encoder.output_dim
@@ -82,10 +93,12 @@ class CRNNBEATsLateFusionModel(nn.Module):
 
     def _fuse(self, cnn_features, beats_features):
         beats_aligned = self.fusion_aligner(beats_features, cnn_features)
+        cnn_for_fusion = self.cnn_pre_fusion_norm(cnn_features)
+        beats_for_fusion = self.beats_pre_fusion_norm(beats_aligned)
         if self.fusion_type == "concat":
-            fused = torch.cat([cnn_features, beats_aligned], dim=-1)
+            fused = torch.cat([cnn_for_fusion, beats_for_fusion], dim=-1)
         elif self.fusion_type == "add":
-            fused = cnn_features + self.add_proj(beats_aligned)
+            fused = cnn_for_fusion + self.add_proj(beats_for_fusion)
         else:
             raise ValueError(f"Unsupported fusion_type: {self.fusion_type}")
         merged = self.merge_mlp(fused)

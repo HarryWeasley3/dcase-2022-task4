@@ -31,10 +31,12 @@ def batched_decode_preds(
     Returns:
         dict of predictions, each keys is a threshold and the value is the DataFrame of predictions.
     """
+    pred_columns = ["event_label", "onset", "offset", "filename"]
+
     # Init a dataframe per threshold
     prediction_dfs = {}
     for threshold in thresholds:
-        prediction_dfs[threshold] = pd.DataFrame()
+        prediction_dfs[threshold] = pd.DataFrame(columns=pred_columns)
 
     for j in range(strong_preds.shape[0]):  # over batches
         for c_th in thresholds:
@@ -46,11 +48,17 @@ def batched_decode_preds(
             pred = pred > c_th
             pred = scipy.ndimage.filters.median_filter(pred, (median_filter, 1))
             pred = encoder.decode_strong(pred)
-            pred = pd.DataFrame(pred, columns=["event_label", "onset", "offset"])
+            pred = pd.DataFrame(pred, columns=pred_columns[:-1])
+            if pred.empty:
+                continue
+
             pred["filename"] = Path(filenames[j]).stem + ".wav"
-            prediction_dfs[c_th] = pd.concat(
-                [prediction_dfs[c_th], pred], ignore_index=True
-            )
+            if prediction_dfs[c_th].empty:
+                prediction_dfs[c_th] = pred.reset_index(drop=True)
+            else:
+                prediction_dfs[c_th] = pd.concat(
+                    [prediction_dfs[c_th], pred], ignore_index=True
+                )
 
     return prediction_dfs
 

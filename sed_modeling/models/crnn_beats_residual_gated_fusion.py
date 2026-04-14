@@ -4,13 +4,13 @@ import torch.nn as nn
 
 
 class CRNNBEATsResidualGatedFusionModel(nn.Module):
-    """Residual gated fusion with a CRNN main path and BEATs residual branch.
+    """Residual gated fusion with a BEATs main path and CRNN correction branch.
 
     Data flow:
         waveform -> CRNN CNN branch
-                -> frozen BEATs branch -> align to CNN time
+                -> BEATs branch -> align to CNN time
                 -> projection + per-branch LayerNorm
-                -> gate([cnn, beats]) and residual fusion
+                -> gate([cnn, beats]) and BEATs-main residual fusion
                 -> shared BiGRU / strong-weak heads
     """
 

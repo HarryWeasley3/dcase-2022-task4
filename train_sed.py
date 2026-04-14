@@ -3,6 +3,7 @@ import inspect
 import os
 import random
 import warnings
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -13,7 +14,7 @@ from desed_task.dataio import ConcatDatasetBatchSampler
 from desed_task.dataio.datasets import (StronglyAnnotatedSet, UnlabeledSet,
                                         WeakSet)
 from desed_task.utils.encoder import ManyHotEncoder
-from desed_task.utils.schedulers import ExponentialWarmup
+from desed_task.utils.schedulers import ExponentialWarmup, WarmupCosineScheduler
 from local.classes_dict import classes_labels
 from local.resample_folder import resample_folder
 from local.sed_trainer import SEDTask4
@@ -21,6 +22,70 @@ from local.utils import generate_tsv_wav_durations
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from sed_modeling import build_sed_model
+
+
+def _torch_load_compat(path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _deep_update(base, override):
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _resolve_profiles(config):
+    resolved = deepcopy(config)
+    top_level_profiles = resolved.pop("profiles", None)
+
+    experiment_cfg = resolved.get("experiment", {})
+    experiment_profiles = None
+    selected_profile = None
+    if isinstance(experiment_cfg, dict):
+        experiment_profiles = experiment_cfg.pop("profiles", None)
+        selected_profile = experiment_cfg.get("profile")
+
+    if selected_profile is None:
+        selected_profile = resolved.pop("profile", None)
+
+    profiles = experiment_profiles or top_level_profiles or {}
+    if selected_profile is None:
+        return resolved
+
+    if selected_profile not in profiles:
+        raise KeyError(
+            f"Unknown config profile '{selected_profile}'. "
+            f"Available profiles: {sorted(profiles.keys())}"
+        )
+
+    _deep_update(resolved, deepcopy(profiles[selected_profile]))
+    resolved.setdefault("experiment", {})
+    resolved["experiment"]["profile"] = selected_profile
+    return resolved
+
+
+def load_experiment_config(conf_file):
+    with open(conf_file, "r") as f:
+        configs = yaml.safe_load(f) or {}
+    return _resolve_profiles(configs)
+
+
+class _NoOpScheduler:
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+        self.step_num = 0
+
+    def _get_scaling_factor(self):
+        return 1.0
+
+    def step(self):
+        self.step_num += 1
 
 
 def _build_trainer_kwargs(
@@ -59,6 +124,81 @@ def _build_trainer_kwargs(
             trainer_kwargs["strategy"] = backend
 
     return trainer_kwargs
+
+
+def _load_init_checkpoint_weights(model, checkpoint_path):
+    map_location = None if torch.cuda.is_available() else torch.device("cpu")
+    checkpoint = _torch_load_compat(checkpoint_path, map_location=map_location)
+    source_state_dict = checkpoint["state_dict"]
+    target_state_dict = model.state_dict()
+
+    candidate_states = []
+    if any(key.startswith("sed_student.") for key in source_state_dict):
+        candidate_states.append(
+            (
+                "sed_student.",
+                {
+                    key[len("sed_student.") :]: value
+                    for key, value in source_state_dict.items()
+                    if key.startswith("sed_student.")
+                },
+            )
+        )
+    candidate_states.append(("", source_state_dict))
+
+    selected_prefix = None
+    selected_state_dict = None
+    load_state = {}
+    unexpected_keys = []
+    shape_mismatch = []
+
+    for prefix, candidate_state in candidate_states:
+        current_load_state = {}
+        current_unexpected = []
+        current_shape_mismatch = []
+        for key, value in candidate_state.items():
+            target_value = target_state_dict.get(key)
+            if target_value is None:
+                current_unexpected.append(key)
+            elif target_value.shape != value.shape:
+                current_shape_mismatch.append(
+                    (key, tuple(value.shape), tuple(target_value.shape))
+                )
+            else:
+                current_load_state[key] = value
+        if len(current_load_state) > len(load_state):
+            selected_prefix = prefix
+            selected_state_dict = candidate_state
+            load_state = current_load_state
+            unexpected_keys = current_unexpected
+            shape_mismatch = current_shape_mismatch
+
+    incompatible = model.load_state_dict(load_state, strict=False)
+    print(
+        f"[init_from_checkpoint] loaded weights from {checkpoint_path} "
+        f"(epoch={checkpoint.get('epoch')}, source_prefix={selected_prefix!r}, "
+        f"loaded_keys={len(load_state)}, missing={len(incompatible.missing_keys)}, "
+        f"unexpected={len(unexpected_keys)}, shape_mismatch={len(shape_mismatch)})"
+    )
+    if incompatible.missing_keys:
+        print(
+            "[init_from_checkpoint] missing keys:",
+            incompatible.missing_keys,
+        )
+    if unexpected_keys:
+        print(
+            "[init_from_checkpoint] unexpected keys:",
+            unexpected_keys,
+        )
+    if shape_mismatch:
+        print(
+            "[init_from_checkpoint] shape mismatch:",
+            shape_mismatch,
+        )
+    if len(load_state) == 0:
+        raise RuntimeError(
+            f"[init_from_checkpoint] no compatible model weights were loaded from {checkpoint_path}."
+        )
 
 
 def resample_data_generate_durations(
@@ -110,6 +250,7 @@ def single_run(
     gpus,
     strong_real=False,
     checkpoint_resume=None,
+    checkpoint_init=None,
     test_state_dict=None,
     fast_dev_run=False,
     evaluation=False,
@@ -123,6 +264,8 @@ def single_run(
         log_dir (str): path to log directory
         gpus (int): number of gpus to use
         checkpoint_resume (str, optional): path to checkpoint to resume from. Defaults to "".
+        checkpoint_init (str, optional): path to checkpoint whose model weights should be used
+            to initialize a new training run without restoring optimizer/scheduler state.
         test_state_dict (dict, optional): if not None, no training is involved. This dictionary is the state_dict
             to be loaded to test the model.
         fast_dev_run (bool, optional): whether to use a run with only one batch at train and validation, useful
@@ -158,6 +301,8 @@ def single_run(
 
     ##### model definition  ############
     sed_student = build_sed_model(config)
+    if checkpoint_init is not None:
+        _load_init_checkpoint_weights(sed_student, checkpoint_init)
 
     if test_state_dict is None:
         ##### data prep train valid ##########
@@ -267,8 +412,25 @@ def single_run(
             trainable_parameters, config["opt"]["lr"], betas=(0.9, 0.999)
         )
         exp_steps = config["training"]["n_epochs_warmup"] * epoch_len
+        scheduler_name = config["opt"].get("scheduler", "exponential_warmup")
+        if scheduler_name in (None, "exponential_warmup", "exp_warmup"):
+            scheduler_impl = ExponentialWarmup(opt, config["opt"]["lr"], exp_steps)
+        elif scheduler_name in ("warmup_cosine", "cosine"):
+            total_steps = config["training"]["n_epochs"] * epoch_len
+            scheduler_impl = WarmupCosineScheduler(
+                opt,
+                config["opt"]["lr"],
+                exp_steps,
+                total_steps,
+                min_lr=config["opt"].get("min_lr", 1e-6),
+            )
+        elif scheduler_name in ("none", "disabled", False):
+            scheduler_impl = _NoOpScheduler(opt)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+
         exp_scheduler = {
-            "scheduler": ExponentialWarmup(opt, config["opt"]["lr"], exp_steps),
+            "scheduler": scheduler_impl,
             "interval": "step",
         }
         logger = TensorBoardLogger(
@@ -361,7 +523,7 @@ def single_run(
         trainer.fit(desed_training, **fit_kwargs)
         best_path = trainer.checkpoint_callback.best_model_path
         print(f"best model: {best_path}")
-        test_state_dict = torch.load(best_path, weights_only=False)["state_dict"]
+        test_state_dict = _torch_load_compat(best_path)["state_dict"]
 
     desed_training.load_state_dict(test_state_dict)
     trainer.test(desed_training)
@@ -392,6 +554,11 @@ if __name__ == "__main__":
         help="Allow the training to be resumed, take as input a previously saved model (.ckpt).",
     )
     parser.add_argument(
+        "--init_from_checkpoint",
+        default=None,
+        help="Initialize model weights from a checkpoint without restoring optimizer/scheduler state.",
+    )
+    parser.add_argument(
         "--test_from_checkpoint", default=None, help="Test the model specified"
     )
     parser.add_argument(
@@ -420,8 +587,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    with open(args.conf_file, "r") as f:
-        configs = yaml.safe_load(f)
+    configs = load_experiment_config(args.conf_file)
 
     configs.setdefault("training", {})
     configs["training"]["synth_only"] = args.synth_only or configs["training"].get(
@@ -435,12 +601,15 @@ if __name__ == "__main__":
         test_from_checkpoint = args.eval_from_checkpoint
         evaluation = True
 
+    if args.resume_from_checkpoint is not None and args.init_from_checkpoint is not None:
+        raise ValueError(
+            "--resume_from_checkpoint and --init_from_checkpoint are mutually exclusive."
+        )
+
     test_model_state_dict = None
     if test_from_checkpoint is not None:
         map_location = None if torch.cuda.is_available() else torch.device("cpu")
-        checkpoint = torch.load(
-            test_from_checkpoint, map_location=map_location, weights_only=False
-        )
+        checkpoint = _torch_load_compat(test_from_checkpoint, map_location=map_location)
         configs_ckpt = checkpoint["hyper_parameters"]
         configs_ckpt["data"] = configs["data"]
         configs = configs_ckpt
@@ -474,6 +643,7 @@ if __name__ == "__main__":
         args.gpus,
         args.strong_real,
         args.resume_from_checkpoint,
+        args.init_from_checkpoint,
         test_model_state_dict,
         args.fast_dev_run,
         evaluation,

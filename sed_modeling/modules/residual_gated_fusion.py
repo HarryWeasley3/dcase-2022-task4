@@ -12,16 +12,17 @@ def _build_activation(name):
 
 
 class ResidualGatedFusion(nn.Module):
-    """Residual gated fusion for a strong CRNN trunk + weaker BEATs branch.
+    """Residual gated fusion with a BEATs main path and CRNN correction branch.
 
-    This block keeps the CRNN stream as the main path and lets the frozen BEATs
-    stream contribute only as a gated residual:
+    This block keeps the stronger BEATs stream as the main path and applies the
+    CRNN stream only as a gated residual correction:
 
-        fused = cnn_norm + gate * beats_norm
+        fused = beats_norm + alpha * gate * cnn_norm
 
-    The explicit projections + per-branch LayerNorm help mitigate the feature
-    scale mismatch we observed in diagnostics, while the gate gives the model a
-    direct way to decide when BEATs should complement the CRNN features.
+    The explicit projections + per-branch LayerNorm keep the two streams on a
+    comparable scale, while the gate and alpha keep the CRNN residual
+    conservative at initialization so the model starts close to the strong
+    BEATs-only solution.
     """
 
     def __init__(
@@ -38,6 +39,7 @@ class ResidualGatedFusion(nn.Module):
         post_fusion_dropout=0.0,
         use_alpha_scale=False,
         alpha_init=1.0,
+        gate_bias_init=-1.5,
     ):
         super().__init__()
         self.gate_mode = gate_mode.lower()
@@ -68,9 +70,16 @@ class ResidualGatedFusion(nn.Module):
             nn.Dropout(gate_dropout),
             nn.Linear(gate_hidden_dim, gate_output_dim),
         )
+        final_gate_layer = self.gate_net[-1]
+        if isinstance(final_gate_layer, nn.Linear):
+            # Start with a small gate so the CRNN branch only makes a weak
+            # residual correction until training proves it is helpful.
+            nn.init.constant_(final_gate_layer.bias, gate_bias_init)
 
         self.use_alpha_scale = use_alpha_scale
         if use_alpha_scale:
+            # A learnable alpha lets us stay close to the BEATs-only baseline at
+            # initialization and grow the CRNN residual only when it improves.
             self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
         else:
             self.register_buffer(
@@ -101,7 +110,7 @@ class ResidualGatedFusion(nn.Module):
         gate_inputs = torch.cat([cnn_normalized, beats_normalized], dim=-1)
         gate = torch.sigmoid(self.gate_net(gate_inputs))
 
-        fused = cnn_normalized + self.alpha * gate * beats_normalized
+        fused = beats_normalized + self.alpha * gate * cnn_normalized
         fused_output = self.post_fusion_proj(fused)
 
         return {
