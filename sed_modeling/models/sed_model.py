@@ -24,6 +24,13 @@ from .crnn_wavlm_late_fusion import CRNNWavLMLateFusionModel
 from .crnn_wavlm_residual_gated_fusion import CRNNWavLMResidualGatedFusionModel
 
 
+def _torch_load_compat(path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _deep_update(base, override):
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -130,6 +137,46 @@ def _normalize_wavlm_branch_cfg(wavlm_branch_cfg):
     return normalized
 
 
+def _extract_checkpoint_state(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "sed_student", "model"):
+            maybe_state = checkpoint.get(key)
+            if isinstance(maybe_state, dict) and maybe_state:
+                return maybe_state, key
+        if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
+            return checkpoint, "checkpoint"
+    raise RuntimeError(
+        "Unsupported checkpoint format. Expected a dict containing one of "
+        "state_dict / sed_student / model, or a plain tensor state_dict."
+    )
+
+
+def _resolve_prefixed_substate(source_state, candidate_prefixes):
+    expanded_prefixes = []
+    for prefix in candidate_prefixes:
+        for candidate in (prefix, f"module.{prefix}"):
+            if candidate not in expanded_prefixes:
+                expanded_prefixes.append(candidate)
+
+    for prefix in expanded_prefixes:
+        matched = {
+            key[len(prefix) :]: value
+            for key, value in source_state.items()
+            if key.startswith(prefix)
+        }
+        if matched:
+            return matched, prefix
+    return None, None
+
+
+def _is_default_warmstart_cfg(warmstart_cfg):
+    return (
+        isinstance(warmstart_cfg, dict)
+        and not warmstart_cfg.get("enable", False)
+        and not warmstart_cfg.get("checkpoint", "")
+    )
+
+
 def _validate_main_branch(main_branch, allowed, enabled_branches):
     if main_branch is None:
         return
@@ -157,7 +204,9 @@ def _resolve_unified_model_axes(model_cfg):
             model_cfg["crnn_encoder"]["train_cnn"] = train_cnn
 
         warmstart_cfg = crnn_branch_cfg.get("warmstart")
-        if isinstance(warmstart_cfg, dict):
+        if isinstance(warmstart_cfg, dict) and _is_default_warmstart_cfg(
+            model_cfg.get("crnn_warmstart")
+        ):
             _deep_update(model_cfg["crnn_warmstart"], warmstart_cfg)
 
     if beats_branch_cfg:
@@ -167,6 +216,11 @@ def _resolve_unified_model_axes(model_cfg):
 
     if wavlm_branch_cfg:
         wavlm_branch_cfg = _normalize_wavlm_branch_cfg(wavlm_branch_cfg)
+        warmstart_cfg = wavlm_branch_cfg.pop("warmstart", None)
+        if isinstance(warmstart_cfg, dict) and _is_default_warmstart_cfg(
+            model_cfg.get("wavlm_warmstart")
+        ):
+            _deep_update(model_cfg["wavlm_warmstart"], warmstart_cfg)
         wavlm_branch_cfg.pop("enabled", None)
         model_cfg["wavlm"] = _deep_update(model_cfg["wavlm"], wavlm_branch_cfg)
 
@@ -296,6 +350,10 @@ def resolve_model_config(config):
             "enable": False,
             "checkpoint": "",
         },
+        "wavlm_warmstart": {
+            "enable": False,
+            "checkpoint": "",
+        },
         "fusion": {
             "enabled": False,
             "strategy": None,
@@ -356,20 +414,20 @@ def _load_decoder_head_warmstart(model, model_cfg):
         print(f"[decoder warm-start] checkpoint not found: {ckpt_path}; skipping.")
         return
 
-    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
-    source_state = checkpoint.get("state_dict", checkpoint)
+    checkpoint = _torch_load_compat(str(ckpt_path), map_location="cpu")
+    source_state, source_container = _extract_checkpoint_state(checkpoint)
     target_state = model.state_dict()
 
-    source_prefix = None
-    for candidate in ("sed_student.decoder.", "decoder."):
-        if any(k.startswith(candidate) for k in source_state):
-            source_prefix = candidate
-            break
+    _, source_prefix = _resolve_prefixed_substate(
+        source_state,
+        ("sed_student.decoder.", "decoder."),
+    )
 
     if source_prefix is None:
         print(
             "[decoder warm-start] no compatible decoder prefix found in "
-            f"{ckpt_path}; checked sed_student.decoder. and decoder.; skipping."
+            f"{ckpt_path}; source container={source_container}; "
+            "checked sed_student.decoder. / decoder. (with optional module.); skipping."
         )
         return
 
@@ -419,7 +477,7 @@ def _load_decoder_head_warmstart(model, model_cfg):
 
     print(
         "[decoder warm-start] loaded decoder/head from "
-        f"{ckpt_path} using prefix {source_prefix}"
+        f"{ckpt_path} using container={source_container} prefix={source_prefix}"
     )
     print(
         "[decoder warm-start] loaded "
@@ -470,8 +528,8 @@ def _load_crnn_encoder_warmstart(model, model_cfg):
         print(f"[crnn warm-start] checkpoint not found: {ckpt_path}; skipping.")
         return
 
-    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
-    source_state = checkpoint.get("state_dict", checkpoint)
+    checkpoint = _torch_load_compat(str(ckpt_path), map_location="cpu")
+    source_state, source_container = _extract_checkpoint_state(checkpoint)
     target_state = model.state_dict()
 
     source_prefix = None
@@ -481,15 +539,25 @@ def _load_crnn_encoder_warmstart(model, model_cfg):
         ("sed_student.cnn.", "crnn_encoder.cnn."),
         ("cnn.", "crnn_encoder.cnn."),
     ):
-        if any(k.startswith(candidate) for k in source_state):
-            source_prefix = candidate
+        matched_prefixes = (candidate, f"module.{candidate}")
+        if any(
+            key.startswith(prefix)
+            for key in source_state
+            for prefix in matched_prefixes
+        ):
+            source_prefix = next(
+                prefix
+                for prefix in matched_prefixes
+                if any(key.startswith(prefix) for key in source_state)
+            )
             source_target_prefix = target_prefix
             break
 
     if source_prefix is None:
         print(
             "[crnn warm-start] no compatible CRNN prefix found in "
-            f"{ckpt_path}; checked crnn_encoder.cnn., sed_student.cnn., and cnn.; skipping."
+            f"{ckpt_path}; source container={source_container}; checked "
+            "crnn_encoder.cnn. / sed_student.cnn. / cnn. (with optional module.); skipping."
         )
         return
 
@@ -523,7 +591,9 @@ def _load_crnn_encoder_warmstart(model, model_cfg):
         loaded_keys.append((target_key, source_key))
 
     skipped_target_keys = [
-        key for key in target_state if key.startswith("crnn_encoder.") and key not in load_state
+        key
+        for key in target_state
+        if key.startswith("crnn_encoder.") and key not in load_state
     ]
 
     missing_keys, unexpected_keys = model.load_state_dict(load_state, strict=False)
@@ -533,7 +603,7 @@ def _load_crnn_encoder_warmstart(model, model_cfg):
 
     print(
         "[crnn warm-start] loaded CRNN encoder from "
-        f"{ckpt_path} using prefix {source_prefix}"
+        f"{ckpt_path} using container={source_container} prefix={source_prefix}"
     )
     print(
         "[crnn warm-start] loaded "
@@ -563,6 +633,133 @@ def _load_crnn_encoder_warmstart(model, model_cfg):
         print(
             "[crnn warm-start] load_state_dict unexpected keys: "
             f"{unexpected_keys}"
+        )
+
+
+def _load_wavlm_encoder_warmstart(model, model_cfg):
+    wavlm_cfg = model_cfg.get("wavlm_warmstart", {})
+    if not wavlm_cfg.get("enable", False):
+        return
+
+    ckpt_path = wavlm_cfg.get("checkpoint", "")
+    if not ckpt_path:
+        print(
+            "[wavlm warm-start] enabled, but model.wavlm_warmstart.checkpoint is empty; "
+            "skipping."
+        )
+        return
+
+    ckpt_path = Path(ckpt_path).expanduser()
+    if not ckpt_path.is_file():
+        print(f"[wavlm warm-start] checkpoint not found: {ckpt_path}; skipping.")
+        return
+
+    target_module = None
+    target_module_name = None
+    if hasattr(model, "wavlm_encoder") and hasattr(model.wavlm_encoder, "wavlm"):
+        target_module = model.wavlm_encoder.wavlm
+        target_module_name = "wavlm_encoder.wavlm"
+    elif (
+        hasattr(model, "encoder")
+        and hasattr(model.encoder, "wavlm")
+    ):
+        target_module = model.encoder.wavlm
+        target_module_name = "encoder.wavlm"
+
+    if target_module is None:
+        print(
+            "[wavlm warm-start] current model has no WavLM branch; skipping "
+            f"checkpoint {ckpt_path}."
+        )
+        return
+
+    checkpoint = _torch_load_compat(str(ckpt_path), map_location="cpu")
+    source_state, source_container = _extract_checkpoint_state(checkpoint)
+    target_state = target_module.state_dict()
+
+    source_branch_state, source_prefix = _resolve_prefixed_substate(
+        source_state,
+        (
+            "wavlm_encoder.wavlm.",
+            "sed_student.wavlm_encoder.wavlm.",
+            "encoder.wavlm.",
+            "sed_student.encoder.wavlm.",
+            "wavlm.",
+        ),
+    )
+
+    if source_branch_state is None:
+        overlapping_keys = [key for key in target_state if key in source_state]
+        if overlapping_keys:
+            source_branch_state = source_state
+            source_prefix = "<raw-wavlm-state-dict>"
+
+    if source_branch_state is None:
+        print(
+            "[wavlm warm-start] no compatible WavLM prefix found in "
+            f"{ckpt_path}; source container={source_container}; checked "
+            "wavlm_encoder.wavlm. / sed_student.wavlm_encoder.wavlm. / "
+            "encoder.wavlm. / sed_student.encoder.wavlm. / wavlm. "
+            "(with optional module.), plus raw WavLM state_dict fallback; skipping."
+        )
+        return
+
+    load_state = {}
+    loaded_keys = []
+    missing_source_keys = []
+    mismatched_keys = []
+    skipped_source_keys = []
+
+    for source_key in source_branch_state:
+        if source_key not in target_state:
+            skipped_source_keys.append(source_key)
+
+    for target_key, target_tensor in target_state.items():
+        if target_key not in source_branch_state:
+            missing_source_keys.append(target_key)
+            continue
+
+        source_tensor = source_branch_state[target_key]
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            mismatched_keys.append(
+                (target_key, tuple(target_tensor.shape), tuple(source_tensor.shape))
+            )
+            continue
+
+        load_state[target_key] = source_tensor
+        loaded_keys.append(target_key)
+
+    incompatible = target_module.load_state_dict(load_state, strict=False)
+    print(
+        "[wavlm warm-start] loaded WavLM branch from "
+        f"{ckpt_path} into {target_module_name} using "
+        f"container={source_container} prefix={source_prefix}"
+    )
+    print(
+        "[wavlm warm-start] loaded "
+        f"{len(loaded_keys)} keys; missing source={len(missing_source_keys)}; "
+        f"shape mismatch={len(mismatched_keys)}; skipped source={len(skipped_source_keys)}"
+    )
+    for key in loaded_keys:
+        print(f"  loaded: {key}")
+    for key in skipped_source_keys:
+        print(
+            f"  skipped source-only key: {key} "
+            "(exists in checkpoint WavLM branch but not in current torchaudio WavLM)"
+        )
+    for key in missing_source_keys:
+        print(f"  missing source: {key}")
+    for key, target_shape, source_shape in mismatched_keys:
+        print(f"  shape mismatch: {key} {source_shape} -> {target_shape}")
+    if incompatible.missing_keys:
+        print(
+            "[wavlm warm-start] target missing keys:",
+            incompatible.missing_keys,
+        )
+    if incompatible.unexpected_keys:
+        print(
+            "[wavlm warm-start] unexpected keys:",
+            incompatible.unexpected_keys,
         )
 
 
@@ -739,6 +936,7 @@ def build_sed_model(config):
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
+        _load_wavlm_encoder_warmstart(model, model_cfg)
         _load_decoder_head_warmstart(model, model_cfg)
         return model
 
@@ -780,6 +978,7 @@ def build_sed_model(config):
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
+        _load_wavlm_encoder_warmstart(model, model_cfg)
         _load_decoder_head_warmstart(model, model_cfg)
         return model
 
@@ -856,6 +1055,7 @@ def build_sed_model(config):
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
+        _load_wavlm_encoder_warmstart(model, model_cfg)
         _load_decoder_head_warmstart(model, model_cfg)
         return model
 
@@ -907,6 +1107,7 @@ def build_sed_model(config):
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
+        _load_wavlm_encoder_warmstart(model, model_cfg)
         _load_decoder_head_warmstart(model, model_cfg)
         return model
 
@@ -926,5 +1127,6 @@ def build_sed_model(config):
         encoder_type=encoder_type,
         build_config=config,
     )
+    _load_wavlm_encoder_warmstart(model, model_cfg)
     _load_decoder_head_warmstart(model, model_cfg)
     return model

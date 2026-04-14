@@ -120,6 +120,9 @@ model:
       output_layer: null
       use_bundle_weights: true
       normalize_waveform: false
+      warmstart:
+        enable: false
+        checkpoint: "./pretrained/wavlm/WavLM_full_finetune_best.pt"
 
   fusion:
     strategy: late
