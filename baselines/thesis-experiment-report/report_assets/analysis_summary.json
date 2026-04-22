@@ -1,0 +1,142 @@
+{
+  "model_sources": [
+    {
+      "model": "CRNN",
+      "source_type": "report",
+      "rel_root": "baselines/CRNN-baseline/training_result_report.md",
+      "best_ckpt": "exp/2022_baseline/version_4/epoch=133-step=111756.ckpt",
+      "note": "Server repo only exposes the final CRNN result in the report, so overall and class metrics are extracted from the markdown report."
+    },
+    {
+      "model": "BEATs",
+      "source_type": "exp",
+      "rel_root": "exp/unified_beats_synth_only_a800_finetune",
+      "best_ckpt": "exp/unified_beats_synth_only_a800_finetune/version_5/epoch=55-step=8791.ckpt",
+      "note": "Quantitative metrics are recomputed from the saved metrics_test prediction TSVs and the official GT/duration files."
+    },
+    {
+      "model": "WavLM",
+      "source_type": "exp",
+      "rel_root": "exp/WavLM_only",
+      "best_ckpt": "exp/WavLM_only/version_0/epoch=49-step=31249.ckpt",
+      "note": "The exp directory contains a newer WavLM-only run that is stronger than the older markdown baseline report, so the exp result is used."
+    },
+    {
+      "model": "CRNN + BEATs",
+      "source_type": "exp",
+      "rel_root": "exp/crnn_beats_final",
+      "best_ckpt": "exp/crnn_beats_final/version_0/epoch=30-step=19374.ckpt",
+      "note": "This is the strongest available fusion run in the current server repo and is therefore adopted as the final two-branch fusion result."
+    },
+    {
+      "model": "CRNN + WavLM",
+      "source_type": "exp",
+      "rel_root": "exp/crnn_wavlm_late_fusion_synth_only_fullft",
+      "best_ckpt": "exp/crnn_wavlm_late_fusion_synth_only_fullft/version_0/epoch=54-step=34374.ckpt",
+      "note": "The current report uses the full threshold prediction set under metrics_test rather than older gate-fusion markdown numbers."
+    },
+    {
+      "model": "CRNN + BEATs + WavLM",
+      "source_type": "exp",
+      "rel_root": "exp/cnn_beats_wavlm_full_unfreeze_late_fusion",
+      "best_ckpt": "exp/cnn_beats_wavlm_full_unfreeze_late_fusion/version_2/epoch=20-step=26249.ckpt",
+      "note": "Three-way fusion metrics are recomputed from metrics_test and compared under the same evaluation code as the other exp models."
+    }
+  ],
+  "fonts": {
+    "latin": "DejaVu Serif",
+    "cjk": "DejaVu Serif"
+  },
+  "representative_classes": [
+    "Alarm_bell_ringing",
+    "Blender",
+    "Dishes",
+    "Cat",
+    "Speech",
+    "Electric_shaver_toothbrush"
+  ],
+  "timeline_models": [
+    "CRNN",
+    "BEATs",
+    "CRNN + BEATs",
+    "CRNN + BEATs + WavLM"
+  ],
+  "timeline_cases": [
+    {
+      "filename": "13.wav",
+      "tag": "Case A",
+      "note": "Dishes/Frying/Speech recovery"
+    },
+    {
+      "filename": "287.wav",
+      "tag": "Case B",
+      "note": "Alarm/Dog rare-event correction"
+    },
+    {
+      "filename": "360.wav",
+      "tag": "Case C",
+      "note": "Fusion-side regression example"
+    }
+  ],
+  "overall_results": {
+    "CRNN": {
+      "psds1": 0.356,
+      "psds2": 0.578,
+      "intersection": 0.65,
+      "event_micro": 43.14,
+      "event_macro": 43.42,
+      "segment_micro": 75.7,
+      "segment_macro": 71.25
+    },
+    "BEATs": {
+      "psds1": 0.46534229982788267,
+      "psds2": 0.7795954647743235,
+      "intersection": 0.6577803657604064,
+      "event_macro": 53.02602956592499,
+      "event_micro": 54.60046271578574,
+      "segment_macro": 81.94585889463895,
+      "segment_micro": 83.6766984748389
+    },
+    "WavLM": {
+      "psds1": 0.3752544723459487,
+      "psds2": 0.6779605824485299,
+      "intersection": 0.5984981014212135,
+      "event_macro": 45.75076699967929,
+      "event_micro": 48.338261383796564,
+      "segment_macro": 71.6721892837769,
+      "segment_micro": 76.15302344714108
+    },
+    "CRNN + BEATs": {
+      "psds1": 0.5215891914492861,
+      "psds2": 0.8162580590790516,
+      "intersection": 0.7431973732277073,
+      "event_macro": 58.62016079743345,
+      "event_micro": 58.34625939625343,
+      "segment_macro": 83.7858599908056,
+      "segment_micro": 84.23924656070741
+    },
+    "CRNN + WavLM": {
+      "psds1": 0.3639073724741635,
+      "psds2": 0.666280222245214,
+      "intersection": 0.6223423524012567,
+      "event_macro": 46.85369998564296,
+      "event_micro": 48.2527525131642,
+      "segment_macro": 71.03216006700058,
+      "segment_micro": 75.70415534495328
+    },
+    "CRNN + BEATs + WavLM": {
+      "psds1": 0.48494739618146326,
+      "psds2": 0.7896301908960922,
+      "intersection": 0.6988772150212526,
+      "event_macro": 56.26603109339191,
+      "event_micro": 55.79889320616979,
+      "segment_macro": 81.94679505751017,
+      "segment_micro": 83.2024914033608
+    }
+  },
+  "missing_items": [
+    "nSEBBs result is not available in the current repository.",
+    "The server-side synced source data still does not expose CRNN operating points for PSDS recomputation.",
+    "SimSun and Times New Roman are unavailable on the current plotting machine; a fallback serif font is used instead."
+  ]
+}
