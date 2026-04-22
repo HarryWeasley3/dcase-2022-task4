@@ -9,7 +9,7 @@ profiles:
       accumulate_batches: 1
       n_epochs_warmup: 10
       n_epochs: 120
-      early_stop_patience: 30
+      early_stop_patience: 20
       precision: 32
       backend: null
       gradient_clip: 1.0
@@ -125,7 +125,7 @@ model:
         checkpoint: "./pretrained/wavlm/WavLM_full_finetune_best_0_65.pt"
 
   fusion:
-    strategy: late
+    strategy: residual_gated
     main_branch: auto
     late:
       combine: concat
