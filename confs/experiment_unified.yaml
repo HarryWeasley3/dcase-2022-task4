@@ -126,6 +126,7 @@ model:
 
   fusion:
     strategy: residual_gated
+    fusion_type: beats_main_residual_gated
     main_branch: auto
     late:
       combine: concat

@@ -271,15 +271,17 @@ def _resolve_unified_model_axes(model_cfg):
         }
         if enabled_tuple == ("crnn", "beats"):
             _validate_main_branch(main_branch, {"auto", "beats"}, enabled_branches)
-            fusion_cfg.setdefault("fusion_type", "residual_gated")
+            # Override the generic late-fusion default ("concat") when we
+            # explicitly select a residual-gated route.
+            fusion_cfg["fusion_type"] = "residual_gated"
             fusion_cfg["main_branch"] = "beats"
         elif enabled_tuple == ("crnn", "wavlm"):
             _validate_main_branch(main_branch, {"auto", "wavlm"}, enabled_branches)
-            fusion_cfg.setdefault("fusion_type", "residual_gated")
+            fusion_cfg["fusion_type"] = "residual_gated"
             fusion_cfg["main_branch"] = "wavlm"
         elif enabled_tuple == ("crnn", "beats", "wavlm"):
             _validate_main_branch(main_branch, {"auto", "beats"}, enabled_branches)
-            fusion_cfg.setdefault("fusion_type", "beats_main_residual_gated")
+            fusion_cfg["fusion_type"] = "beats_main_residual_gated"
             fusion_cfg["main_branch"] = "beats"
     else:
         raise ValueError(f"Unsupported fusion strategy: {strategy}")
