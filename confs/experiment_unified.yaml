@@ -13,6 +13,43 @@ profiles:
       precision: 32
       backend: null
       gradient_clip: 1.0
+  hierarchical_ssl_stage_a:
+    training:
+      batch_size: 8
+      batch_size_val: 8
+      num_workers: 4
+      accumulate_batches: 1
+      n_epochs_warmup: 10
+      n_epochs: 120
+      early_stop_patience: 20
+      precision: 32
+      backend: null
+      gradient_clip: 1.0
+    model:
+      fusion:
+        strategy: hierarchical_ssl
+        fusion_type: concat
+        main_branch: beats
+        align_method: adaptive_avg
+        interpolate_mode: linear
+        merge_mlp_dim: 256
+        merge_activation: gelu
+        merge_dropout: 0.5
+        use_layernorm: true
+      ssl_hierarchical_fusion:
+        enable: true
+        beats_main: true
+        num_stages: 2
+        beats_layers: [5, 11]
+        wavlm_layers: [5, 11]
+        fuse_dim: 256
+        align_method: adaptive_avg
+        interpolate_mode: linear
+        gate_mode: channel
+        gate_hidden_dim: 256
+        gate_dropout: 0.3
+        use_alpha_scale: true
+        alpha_init: 0.2
 
 training:
   synth_only: true

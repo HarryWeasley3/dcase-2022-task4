@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -23,7 +24,13 @@ def _disabled_autocast_context(device_type):
 
 
 class BEATsEncoder(nn.Module):
-    """Frozen-or-trainable BEATs feature extractor returning sequence features."""
+    """Frozen-or-trainable BEATs feature extractor returning sequence features.
+
+    Default behavior matches the existing single-layer contract. Callers can
+    explicitly request multi-layer hidden states via ``selected_layers`` or
+    ``return_all_layers`` when a structured output is needed for experimental
+    fusion modules.
+    """
 
     def __init__(
         self,
@@ -67,6 +74,49 @@ class BEATsEncoder(nn.Module):
             for param in self.beats.parameters():
                 param.requires_grad = False
             self.beats.eval()
+
+    @property
+    def num_layers(self):
+        return len(self.beats.encoder.layers)
+
+    def _validate_requested_layers(
+        self, selected_layers: Optional[Sequence[int]]
+    ):
+        if selected_layers is None:
+            return None
+        if not isinstance(selected_layers, (list, tuple)):
+            raise TypeError(
+                "BEATsEncoder selected_layers must be a list or tuple of zero-based "
+                f"layer indices, got {type(selected_layers)!r}."
+            )
+        if len(selected_layers) == 0:
+            raise ValueError("BEATsEncoder selected_layers must not be empty.")
+
+        validated = []
+        for layer_idx in selected_layers:
+            if not isinstance(layer_idx, int):
+                raise TypeError(
+                    "BEATsEncoder selected_layers must contain integers, "
+                    f"got {type(layer_idx)!r}."
+                )
+            if layer_idx < 0 or layer_idx >= self.num_layers:
+                raise ValueError(
+                    "BEATsEncoder layer index out of range: "
+                    f"{layer_idx}. Valid range is [0, {self.num_layers - 1}]."
+                )
+            validated.append(layer_idx)
+        return validated
+
+    def _validate_feature_layer(self):
+        if self.feature_layer is None:
+            return None
+        feature_layer = int(self.feature_layer)
+        if feature_layer < 0 or feature_layer >= self.num_layers:
+            raise ValueError(
+                "model.beats.feature_layer is out of range: "
+                f"{feature_layer}. Valid range is [0, {self.num_layers - 1}]."
+            )
+        return feature_layer
 
     def _load_branch_weights(self, checkpoint_path):
         checkpoint = _torch_load_compat(checkpoint_path, map_location="cpu")
@@ -139,7 +189,7 @@ class BEATsEncoder(nn.Module):
     def prepare_inputs(self, audio):
         return audio
 
-    def _extract_sequence_features(self, audio, padding_mask=None):
+    def _prepare_encoder_inputs(self, audio, padding_mask=None):
         fbank = self.beats.preprocess(
             audio, fbank_mean=self.fbank_mean, fbank_std=self.fbank_std
         )
@@ -158,24 +208,124 @@ class BEATsEncoder(nn.Module):
             patches = self.beats.post_extract_proj(patches)
 
         x = self.beats.dropout_input(patches)
-        x, _ = self.beats.encoder(
-            x,
-            padding_mask=padding_mask,
-            layer=self.feature_layer,
-        )
-
         return {
-            "sequence_features": x,
+            "encoder_inputs": x,
             "frontend_features": fbank,
             "padding_mask": padding_mask,
         }
 
-    def forward(self, audio, padding_mask=None):
+    @staticmethod
+    def _layer_results_to_hidden_states(layer_results):
+        return [layer_output.transpose(0, 1).contiguous() for layer_output, _ in layer_results]
+
+    def _extract_sequence_features(
+        self,
+        audio,
+        padding_mask=None,
+        selected_layers=None,
+        return_all_layers=False,
+        return_layer_dict=False,
+    ):
+        if return_layer_dict and selected_layers is None and not return_all_layers:
+            return_all_layers = True
+
+        prepared = self._prepare_encoder_inputs(audio, padding_mask=padding_mask)
+        encoder_inputs = prepared["encoder_inputs"]
+        need_layer_outputs = return_all_layers or selected_layers is not None
+
+        if not need_layer_outputs:
+            feature_layer = self._validate_feature_layer()
+            sequence_features, _ = self.beats.encoder(
+                encoder_inputs,
+                padding_mask=prepared["padding_mask"],
+                layer=feature_layer,
+            )
+            return {
+                "sequence_features": sequence_features,
+                "frontend_features": prepared["frontend_features"],
+                "padding_mask": prepared["padding_mask"],
+            }
+
+        validated_layers = self._validate_requested_layers(selected_layers)
+        sequence_features, layer_results = self.beats.encoder(
+            encoder_inputs,
+            padding_mask=prepared["padding_mask"],
+            layer=None,
+        )
+        all_hidden_states = self._layer_results_to_hidden_states(layer_results)
+        if len(all_hidden_states) != self.num_layers:
+            raise RuntimeError(
+                "BEATsEncoder expected one hidden state per encoder layer, got "
+                f"{len(all_hidden_states)} for {self.num_layers} layers."
+            )
+
+        feature_layer = self._validate_feature_layer()
+        if feature_layer is not None:
+            sequence_features = all_hidden_states[feature_layer]
+
+        if return_all_layers:
+            selected_layer_indices = list(range(self.num_layers))
+        else:
+            selected_layer_indices = validated_layers
+
+        selected_hidden_states = (
+            [all_hidden_states[layer_idx] for layer_idx in selected_layer_indices]
+            if selected_layer_indices is not None
+            else None
+        )
+
+        outputs = {
+            "sequence_features": sequence_features,
+            "frontend_features": prepared["frontend_features"],
+            "padding_mask": prepared["padding_mask"],
+            "selected_layers": selected_layer_indices,
+            "selected_hidden_states": selected_hidden_states,
+        }
+        if return_all_layers:
+            outputs["all_hidden_states"] = all_hidden_states
+        if return_layer_dict:
+            layer_indices = (
+                selected_layer_indices
+                if selected_layer_indices is not None
+                else list(range(self.num_layers))
+            )
+            layer_hidden_states = (
+                selected_hidden_states
+                if selected_hidden_states is not None
+                else all_hidden_states
+            )
+            outputs["layer_features"] = {
+                layer_idx: hidden_state
+                for layer_idx, hidden_state in zip(layer_indices, layer_hidden_states)
+            }
+
+        return outputs
+
+    def forward(
+        self,
+        audio,
+        padding_mask=None,
+        selected_layers=None,
+        return_all_layers=False,
+        return_layer_dict=False,
+    ):
         if self.is_frozen:
             autocast_context = _disabled_autocast_context(audio.device.type)
             with torch.no_grad(), autocast_context:
-                return self._extract_sequence_features(audio, padding_mask=padding_mask)
-        return self._extract_sequence_features(audio, padding_mask=padding_mask)
+                return self._extract_sequence_features(
+                    audio,
+                    padding_mask=padding_mask,
+                    selected_layers=selected_layers,
+                    return_all_layers=return_all_layers,
+                    return_layer_dict=return_layer_dict,
+                )
+        return self._extract_sequence_features(
+            audio,
+            padding_mask=padding_mask,
+            selected_layers=selected_layers,
+            return_all_layers=return_all_layers,
+            return_layer_dict=return_layer_dict,
+        )
 
     def train(self, mode=True):
         super().train(mode)

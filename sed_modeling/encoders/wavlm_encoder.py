@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -55,6 +56,10 @@ class WavLMEncoder(nn.Module):
             for param in self.wavlm.parameters():
                 param.requires_grad = False
             self.wavlm.eval()
+
+    @property
+    def num_layers(self):
+        return int(self.bundle._params["encoder_num_layers"])
 
     @staticmethod
     def _resolve_bundle(bundle_name):
@@ -129,27 +134,149 @@ class WavLMEncoder(nn.Module):
         lengths = (~padding_mask).sum(dim=-1)
         return lengths.to(device=audio.device, dtype=torch.long)
 
-    def _extract_sequence_features(self, audio, padding_mask=None):
+    def _validate_requested_layers(
+        self, selected_layers: Optional[Sequence[int]]
+    ):
+        if selected_layers is None:
+            return None
+        if not isinstance(selected_layers, (list, tuple)):
+            raise TypeError(
+                "WavLMEncoder selected_layers must be a list or tuple of zero-based "
+                f"layer indices, got {type(selected_layers)!r}."
+            )
+        if len(selected_layers) == 0:
+            raise ValueError("WavLMEncoder selected_layers must not be empty.")
+
+        validated = []
+        for layer_idx in selected_layers:
+            if not isinstance(layer_idx, int):
+                raise TypeError(
+                    "WavLMEncoder selected_layers must contain integers, "
+                    f"got {type(layer_idx)!r}."
+                )
+            if layer_idx < 0 or layer_idx >= self.num_layers:
+                raise ValueError(
+                    "WavLMEncoder layer index out of range: "
+                    f"{layer_idx}. Valid range is [0, {self.num_layers - 1}]."
+                )
+            validated.append(layer_idx)
+        return validated
+
+    def _validate_output_layer(self):
+        if self.output_layer is None:
+            return None
+        output_layer = int(self.output_layer)
+        if output_layer <= 0 or output_layer > self.num_layers:
+            raise ValueError(
+                "model.wavlm.output_layer is out of range: "
+                f"{output_layer}. Valid range is [1, {self.num_layers}]."
+            )
+        return output_layer
+
+    def _extract_sequence_features(
+        self,
+        audio,
+        padding_mask=None,
+        selected_layers=None,
+        return_all_layers=False,
+        return_layer_dict=False,
+    ):
         audio = self._normalize_audio(audio)
         lengths = self._padding_mask_to_lengths(audio, padding_mask)
 
-        if self.output_layer is not None:
-            features, lengths = self.wavlm.extract_features(
+        if return_layer_dict and selected_layers is None and not return_all_layers:
+            return_all_layers = True
+
+        need_layer_outputs = return_all_layers or selected_layers is not None
+        validated_output_layer = self._validate_output_layer()
+
+        if not need_layer_outputs:
+            if validated_output_layer is not None:
+                features, lengths = self.wavlm.extract_features(
+                    audio,
+                    lengths=lengths,
+                    num_layers=validated_output_layer,
+                )
+                sequence_features = features[-1]
+            else:
+                sequence_features, lengths = self.wavlm(audio, lengths=lengths)
+            return {
+                "sequence_features": sequence_features,
+                "frontend_features": audio,
+                "lengths": lengths,
+            }
+
+        validated_layers = self._validate_requested_layers(selected_layers)
+
+        if return_all_layers or validated_output_layer is None:
+            layer_outputs, lengths = self.wavlm.extract_features(
                 audio,
                 lengths=lengths,
-                num_layers=int(self.output_layer),
+                num_layers=None,
             )
-            sequence_features = features[-1]
         else:
-            sequence_features, lengths = self.wavlm(audio, lengths=lengths)
+            max_requested_layer = max(validated_layers) + 1
+            layer_outputs, lengths = self.wavlm.extract_features(
+                audio,
+                lengths=lengths,
+                num_layers=max(max_requested_layer, validated_output_layer),
+            )
 
-        return {
+        all_hidden_states = [hidden_state.contiguous() for hidden_state in layer_outputs]
+        if not all_hidden_states:
+            raise RuntimeError("WavLMEncoder did not return any hidden states.")
+
+        if validated_output_layer is not None:
+            sequence_features = all_hidden_states[validated_output_layer - 1]
+        else:
+            sequence_features = all_hidden_states[-1]
+
+        if return_all_layers:
+            selected_layer_indices = list(range(len(all_hidden_states)))
+        else:
+            selected_layer_indices = validated_layers
+
+        selected_hidden_states = (
+            [all_hidden_states[layer_idx] for layer_idx in selected_layer_indices]
+            if selected_layer_indices is not None
+            else None
+        )
+
+        outputs = {
             "sequence_features": sequence_features,
             "frontend_features": audio,
             "lengths": lengths,
+            "selected_layers": selected_layer_indices,
+            "selected_hidden_states": selected_hidden_states,
         }
+        if return_all_layers:
+            outputs["all_hidden_states"] = all_hidden_states
+        if return_layer_dict:
+            layer_indices = (
+                selected_layer_indices
+                if selected_layer_indices is not None
+                else list(range(len(all_hidden_states)))
+            )
+            layer_hidden_states = (
+                selected_hidden_states
+                if selected_hidden_states is not None
+                else all_hidden_states
+            )
+            outputs["layer_features"] = {
+                layer_idx: hidden_state
+                for layer_idx, hidden_state in zip(layer_indices, layer_hidden_states)
+            }
 
-    def forward(self, audio, padding_mask=None):
+        return outputs
+
+    def forward(
+        self,
+        audio,
+        padding_mask=None,
+        selected_layers=None,
+        return_all_layers=False,
+        return_layer_dict=False,
+    ):
         if self.is_frozen:
             autocast_context = (
                 torch.amp.autocast("cuda", enabled=False)
@@ -157,8 +284,21 @@ class WavLMEncoder(nn.Module):
                 else torch.autocast("cpu", enabled=False)
             )
             with torch.no_grad(), autocast_context:
-                return self._extract_sequence_features(audio, padding_mask=padding_mask)
-        return self._extract_sequence_features(audio, padding_mask=padding_mask)
+                return self._extract_sequence_features(
+                    audio,
+                    padding_mask=padding_mask,
+                    selected_layers=selected_layers,
+                    return_all_layers=return_all_layers,
+                    return_layer_dict=return_layer_dict,
+                )
+
+        return self._extract_sequence_features(
+            audio,
+            padding_mask=padding_mask,
+            selected_layers=selected_layers,
+            return_all_layers=return_all_layers,
+            return_layer_dict=return_layer_dict,
+        )
 
     def train(self, mode=True):
         super().train(mode)

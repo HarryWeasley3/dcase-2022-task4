@@ -7,6 +7,7 @@ import torch.nn as nn
 from sed_modeling.decoders import SEDDecoder
 from sed_modeling.encoders import BEATsEncoder, CRNNEncoder, WavLMEncoder
 from sed_modeling.modules import (
+    BEATsMainHierarchicalWavLMFusion,
     BEATsMainResidualGatedFusion,
     FusionTimeAligner,
     MergeMLP,
@@ -16,6 +17,9 @@ from sed_modeling.modules import (
 
 from .crnn_beats_late_fusion import CRNNBEATsLateFusionModel
 from .crnn_beats_residual_gated_fusion import CRNNBEATsResidualGatedFusionModel
+from .crnn_beats_wavlm_hierarchical_ssl_fusion import (
+    CRNNBEATsWavLMHierarchicalSSLFusionModel,
+)
 from .crnn_beats_wavlm_late_fusion import CRNNBEATsWavLMLateFusionModel
 from .crnn_beats_wavlm_residual_gated_fusion import (
     CRNNBEATsWavLMResidualGatedFusionModel,
@@ -48,6 +52,12 @@ def _normalize_strategy_name(strategy):
         return "late"
     if strategy_name in {"residual_gated", "gated", "gate", "residual"}:
         return "residual_gated"
+    if strategy_name in {
+        "hierarchical_ssl",
+        "hierarchical_ssl_fusion",
+        "hierarchical",
+    }:
+        return "hierarchical_ssl"
     return strategy_name
 
 
@@ -283,6 +293,15 @@ def _resolve_unified_model_axes(model_cfg):
             _validate_main_branch(main_branch, {"auto", "beats"}, enabled_branches)
             fusion_cfg["fusion_type"] = "beats_main_residual_gated"
             fusion_cfg["main_branch"] = "beats"
+    elif strategy == "hierarchical_ssl":
+        mapping = {
+            ("crnn", "beats", "wavlm"): "crnn_beats_wavlm_hierarchical_ssl_fusion",
+        }
+        _validate_main_branch(main_branch, {"auto", "beats"}, enabled_branches)
+        fusion_cfg["fusion_type"] = "hierarchical_ssl"
+        fusion_cfg["main_branch"] = "beats"
+        ssl_hierarchical_cfg = model_cfg.setdefault("ssl_hierarchical_fusion", {})
+        ssl_hierarchical_cfg["enable"] = ssl_hierarchical_cfg.get("enable", True)
     else:
         raise ValueError(f"Unsupported fusion strategy: {strategy}")
 
@@ -380,6 +399,22 @@ def resolve_model_config(config):
             "alpha_init": 1.0,
             "load_beats_decoder_head": False,
             "beats_decoder_head_ckpt": "",
+        },
+        "ssl_hierarchical_fusion": {
+            "enable": False,
+            "beats_main": True,
+            "num_stages": 1,
+            "beats_layers": [8],
+            "wavlm_layers": [8],
+            "fuse_dim": 256,
+            "align_method": "adaptive_avg",
+            "interpolate_mode": "linear",
+            "gate_mode": "channel",
+            "gate_hidden_dim": None,
+            "gate_activation": "gelu",
+            "gate_dropout": net_cfg.get("dropout", 0.5),
+            "use_alpha_scale": False,
+            "alpha_init": 1.0,
         },
         "teacher": {
             "share_frozen_encoder": True,
@@ -1106,6 +1141,79 @@ def build_sed_model(config):
             fusion_block=fusion_block,
             decoder=_build_shared_decoder(fusion_block.output_dim, config, model_cfg),
             label_aligner=_build_time_aligner(model_cfg),
+            build_config=config,
+        )
+        _load_crnn_encoder_warmstart(model, model_cfg)
+        _load_wavlm_encoder_warmstart(model, model_cfg)
+        _load_decoder_head_warmstart(model, model_cfg)
+        return model
+
+    if model_type == "crnn_beats_wavlm_hierarchical_ssl_fusion":
+        crnn_encoder = CRNNEncoder(config["feats"], model_cfg["crnn_encoder"])
+        beats_encoder = BEATsEncoder(**model_cfg["beats"])
+        wavlm_encoder = WavLMEncoder(**model_cfg["wavlm"])
+        fusion_cfg = model_cfg["fusion"]
+        ssl_hierarchical_cfg = model_cfg.get("ssl_hierarchical_fusion", {})
+
+        if not ssl_hierarchical_cfg.get("enable", False):
+            raise ValueError(
+                "crnn_beats_wavlm_hierarchical_ssl_fusion requires "
+                "model.ssl_hierarchical_fusion.enable=true."
+            )
+        if not ssl_hierarchical_cfg.get("beats_main", True):
+            raise ValueError(
+                "Stage-A hierarchical SSL fusion only supports BEATs as the main "
+                "branch, so model.ssl_hierarchical_fusion.beats_main must be true."
+            )
+
+        fusion_type = fusion_cfg.get("fusion_type", "concat").lower()
+        if fusion_type not in {"concat", "hierarchical_ssl"}:
+            raise ValueError(
+                "CRNN + hierarchical SSL fusion currently supports only "
+                "fusion_type='concat' (or the normalized route marker "
+                "'hierarchical_ssl')."
+            )
+
+        ssl_fuse_dim = ssl_hierarchical_cfg.get(
+            "fuse_dim",
+            fusion_cfg.get("merge_mlp_dim", 256),
+        )
+        ssl_fusion_block = BEATsMainHierarchicalWavLMFusion(
+            beats_input_dim=beats_encoder.output_dim,
+            wavlm_input_dim=wavlm_encoder.output_dim,
+            fuse_dim=ssl_fuse_dim,
+            num_stages=ssl_hierarchical_cfg.get("num_stages", 1),
+            align_method=ssl_hierarchical_cfg.get("align_method", "adaptive_avg"),
+            interpolate_mode=ssl_hierarchical_cfg.get("interpolate_mode", "linear"),
+            gate_mode=ssl_hierarchical_cfg.get("gate_mode", "channel"),
+            gate_hidden_dim=ssl_hierarchical_cfg.get("gate_hidden_dim"),
+            gate_activation=ssl_hierarchical_cfg.get("gate_activation", "gelu"),
+            gate_dropout=ssl_hierarchical_cfg.get("gate_dropout", 0.5),
+            use_alpha_scale=ssl_hierarchical_cfg.get("use_alpha_scale", False),
+            alpha_init=ssl_hierarchical_cfg.get("alpha_init", 1.0),
+        )
+
+        merge_mlp = MergeMLP(
+            input_dim=crnn_encoder.output_dim + ssl_fusion_block.output_dim,
+            output_dim=fusion_cfg.get("merge_mlp_dim", 256),
+            activation=fusion_cfg.get("merge_activation", "gelu"),
+            dropout=fusion_cfg.get("merge_dropout", 0.5),
+            use_layernorm=fusion_cfg.get("use_layernorm", False),
+        )
+        model = CRNNBEATsWavLMHierarchicalSSLFusionModel(
+            crnn_encoder=crnn_encoder,
+            beats_encoder=beats_encoder,
+            wavlm_encoder=wavlm_encoder,
+            ssl_fusion_block=ssl_fusion_block,
+            final_fusion_aligner=_build_fusion_aligner(fusion_cfg),
+            merge_mlp=merge_mlp,
+            decoder=_build_shared_decoder(
+                fusion_cfg.get("merge_mlp_dim", 256), config, model_cfg
+            ),
+            label_aligner=_build_time_aligner(model_cfg),
+            beats_layers=ssl_hierarchical_cfg.get("beats_layers", [8]),
+            wavlm_layers=ssl_hierarchical_cfg.get("wavlm_layers", [8]),
+            use_branch_layernorm=fusion_cfg.get("use_layernorm", False),
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)

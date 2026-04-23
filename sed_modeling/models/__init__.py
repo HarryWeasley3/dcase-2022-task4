@@ -1,5 +1,8 @@
 from .crnn_beats_late_fusion import CRNNBEATsLateFusionModel
 from .crnn_beats_residual_gated_fusion import CRNNBEATsResidualGatedFusionModel
+from .crnn_beats_wavlm_hierarchical_ssl_fusion import (
+    CRNNBEATsWavLMHierarchicalSSLFusionModel,
+)
 from .crnn_beats_wavlm_late_fusion import CRNNBEATsWavLMLateFusionModel
 from .crnn_beats_wavlm_residual_gated_fusion import (
     CRNNBEATsWavLMResidualGatedFusionModel,
@@ -12,6 +15,7 @@ __all__ = [
     "SEDModel",
     "CRNNBEATsLateFusionModel",
     "CRNNBEATsResidualGatedFusionModel",
+    "CRNNBEATsWavLMHierarchicalSSLFusionModel",
     "CRNNBEATsWavLMLateFusionModel",
     "CRNNBEATsWavLMResidualGatedFusionModel",
     "CRNNWavLMLateFusionModel",
