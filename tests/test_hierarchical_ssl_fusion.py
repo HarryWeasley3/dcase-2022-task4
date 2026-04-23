@@ -14,9 +14,12 @@ class _FakeBeatsBackbone:
         del padding_mask
         current = x
         layer_results = []
+        if layer is not None:
+            layer_results.append((current.transpose(0, 1).contiguous(), None))
         for layer_idx in range(len(self.layers)):
             current = current + float(layer_idx + 1)
-            layer_results.append((current.transpose(0, 1).contiguous(), None))
+            if layer is not None:
+                layer_results.append((current.transpose(0, 1).contiguous(), None))
             if layer is not None and layer_idx == layer:
                 return current, layer_results
         return current, layer_results

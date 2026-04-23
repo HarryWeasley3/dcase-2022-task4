@@ -1,4 +1,4 @@
-profile: server_a800
+profile: hierarchical_ssl_stage_a
 
 profiles:
   server_a800:

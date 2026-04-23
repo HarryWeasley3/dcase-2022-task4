@@ -215,8 +215,27 @@ class BEATsEncoder(nn.Module):
         }
 
     @staticmethod
-    def _layer_results_to_hidden_states(layer_results):
-        return [layer_output.transpose(0, 1).contiguous() for layer_output, _ in layer_results]
+    def _layer_results_to_hidden_states(layer_results, target_layer):
+        if target_layer is None:
+            raise ValueError("target_layer must be provided when collecting BEATs hidden states.")
+        if len(layer_results) == 0:
+            raise RuntimeError(
+                "BEATs encoder returned no layer_results. The third-party backbone only "
+                "collects intermediate states when a concrete target layer is requested."
+            )
+
+        hidden_states = [
+            layer_output.transpose(0, 1).contiguous()
+            for layer_output, _ in layer_results[1:]
+        ]
+        expected_num_states = int(target_layer) + 1
+        if len(hidden_states) != expected_num_states:
+            raise RuntimeError(
+                "BEATsEncoder expected "
+                f"{expected_num_states} hidden states up to target_layer={target_layer}, "
+                f"got {len(hidden_states)}."
+            )
+        return hidden_states
 
     def _extract_sequence_features(
         self,
@@ -247,24 +266,36 @@ class BEATsEncoder(nn.Module):
             }
 
         validated_layers = self._validate_requested_layers(selected_layers)
+        feature_layer = self._validate_feature_layer()
+        candidate_layers = []
+        if validated_layers is not None:
+            candidate_layers.extend(validated_layers)
+        if feature_layer is not None:
+            candidate_layers.append(feature_layer)
+        if return_all_layers:
+            target_layer = self.num_layers - 1
+        elif candidate_layers:
+            target_layer = max(candidate_layers)
+        else:
+            raise RuntimeError(
+                "BEATsEncoder multi-layer extraction requires at least one selected "
+                "layer or an explicit feature_layer."
+            )
+
         sequence_features, layer_results = self.beats.encoder(
             encoder_inputs,
             padding_mask=prepared["padding_mask"],
-            layer=None,
+            layer=target_layer,
         )
-        all_hidden_states = self._layer_results_to_hidden_states(layer_results)
-        if len(all_hidden_states) != self.num_layers:
-            raise RuntimeError(
-                "BEATsEncoder expected one hidden state per encoder layer, got "
-                f"{len(all_hidden_states)} for {self.num_layers} layers."
-            )
-
-        feature_layer = self._validate_feature_layer()
+        all_hidden_states = self._layer_results_to_hidden_states(
+            layer_results,
+            target_layer=target_layer,
+        )
         if feature_layer is not None:
             sequence_features = all_hidden_states[feature_layer]
 
         if return_all_layers:
-            selected_layer_indices = list(range(self.num_layers))
+            selected_layer_indices = list(range(target_layer + 1))
         else:
             selected_layer_indices = validated_layers
 
