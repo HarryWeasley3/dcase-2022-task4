@@ -48,6 +48,7 @@ class WarmupCosineScheduler(BaseScheduler):
         total_steps,
         min_lr=1e-6,
         exponent=-5.0,
+        decay_power=1.0,
     ):
         super().__init__(optimizer)
         self.rampup_len = rampup_length
@@ -56,6 +57,11 @@ class WarmupCosineScheduler(BaseScheduler):
         self.min_lr = min_lr
         self.step_num = 1
         self.exponent = exponent
+        self.decay_power = float(decay_power)
+        if self.decay_power <= 0.0:
+            raise ValueError(
+                f"WarmupCosineScheduler decay_power must be > 0, got {decay_power}."
+            )
 
     def _get_scaling_factor(self):
         if self.rampup_len == 0:
@@ -74,5 +80,6 @@ class WarmupCosineScheduler(BaseScheduler):
 
         decay_step = min(self.step_num, self.total_steps)
         progress = (decay_step - self.rampup_len) / (self.total_steps - self.rampup_len)
-        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        shaped_progress = progress ** self.decay_power
+        cosine = 0.5 * (1.0 + np.cos(np.pi * shaped_progress))
         return float(self.min_lr + (self.max_lr - self.min_lr) * cosine)

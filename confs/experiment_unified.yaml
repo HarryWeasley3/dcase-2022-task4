@@ -101,6 +101,7 @@ opt:
   lr: 0.000015
   scheduler: warmup_cosine
   min_lr: 0.000001
+  decay_power: 0.6
 
 feats:
   n_mels: 128

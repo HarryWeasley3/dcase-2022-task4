@@ -423,6 +423,7 @@ def single_run(
                 exp_steps,
                 total_steps,
                 min_lr=config["opt"].get("min_lr", 1e-6),
+                decay_power=config["opt"].get("decay_power", 1.0),
             )
         elif scheduler_name in ("none", "disabled", False):
             scheduler_impl = _NoOpScheduler(opt)
