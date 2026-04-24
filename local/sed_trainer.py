@@ -154,6 +154,7 @@ class SEDTask4(pl.LightningModule):
         self.test_psds_buffer_teacher = {k: pd.DataFrame() for k in test_thresholds}
         self.decoded_student_05_buffer = pd.DataFrame()
         self.decoded_teacher_05_buffer = pd.DataFrame()
+        self.latest_test_results = {}
 
     def _disable_autocast_context(self):
         if self.device.type == "cuda":
@@ -423,9 +424,19 @@ class SEDTask4(pl.LightningModule):
             strong_self_sup_loss,
             batch_size=batch_num,
         )
+        current_group_lrs = []
+        for group_index, param_group in enumerate(self.opt.param_groups):
+            group_name = param_group.get("name", f"group_{group_index}")
+            group_lr = param_group["lr"]
+            current_group_lrs.append(group_lr)
+            self.log(
+                f"train/lr/{group_name}",
+                group_lr,
+                batch_size=batch_num,
+            )
         self.log(
             "train/lr",
-            self.opt.param_groups[-1]["lr"],
+            max(current_group_lrs),
             prog_bar=True,
             batch_size=batch_num,
         )
@@ -903,6 +914,10 @@ class SEDTask4(pl.LightningModule):
                 self.logger.log_metrics(results)
                 self.logger.log_hyperparams(self.hparams, results)
 
+            self.latest_test_results = {
+                key: float(value.item()) if torch.is_tensor(value) else float(value)
+                for key, value in results.items()
+            }
             for key in results.keys():
                 self.log(key, results[key], prog_bar=True, logger=False)
 

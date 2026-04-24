@@ -4,7 +4,12 @@ import torch.nn as nn
 
 
 class CRNNBEATsWavLMResidualGatedFusionModel(nn.Module):
-    """Three-way residual gated fusion with BEATs as the main path."""
+    """Three-way residual gated fusion with BEATs as the main path.
+
+    Legacy mode aligns BEATs/WavLM to the CRNN timeline first.
+    BEATs time-anchor mode keeps BEATs on its native timeline, aligns WavLM and
+    CRNN to BEATs, and performs SSL fusion before the final CRNN residual merge.
+    """
 
     def __init__(
         self,
@@ -27,6 +32,9 @@ class CRNNBEATsWavLMResidualGatedFusionModel(nn.Module):
         self.label_aligner = label_aligner
         self.encoder_type = "crnn_beats_wavlm_residual_gated_fusion"
         self.build_config = deepcopy(build_config) if build_config is not None else None
+        self.use_beats_time_anchor = getattr(
+            fusion_block, "use_beats_time_anchor", False
+        )
 
     @property
     def needs_input_scaler(self):
@@ -86,10 +94,17 @@ class CRNNBEATsWavLMResidualGatedFusionModel(nn.Module):
         beats_features = beats_outputs["sequence_features"]
         wavlm_features = wavlm_outputs["sequence_features"]
 
-        beats_aligned = self.fusion_aligner(beats_features, cnn_features)
-        wavlm_aligned = self.fusion_aligner(wavlm_features, cnn_features)
+        if self.use_beats_time_anchor:
+            beats_aligned = beats_features
+            wavlm_aligned = self.fusion_aligner(wavlm_features, beats_features)
+            crnn_aligned = self.fusion_aligner(cnn_features, beats_features)
+        else:
+            beats_aligned = self.fusion_aligner(beats_features, cnn_features)
+            wavlm_aligned = self.fusion_aligner(wavlm_features, cnn_features)
+            crnn_aligned = cnn_features
+
         fusion_outputs = self.fusion_block(
-            cnn_features,
+            crnn_aligned,
             beats_aligned,
             wavlm_aligned,
         )
@@ -108,23 +123,40 @@ class CRNNBEATsWavLMResidualGatedFusionModel(nn.Module):
             "cnn_sequence_features": cnn_features,
             "beats_sequence_features": beats_features,
             "wavlm_sequence_features": wavlm_features,
+            "use_beats_time_anchor": self.use_beats_time_anchor,
             "beats_aligned_features": beats_aligned,
             "wavlm_aligned_features": wavlm_aligned,
+            "beats_anchor_sequence_features": beats_features,
+            "wavlm_aligned_to_beats_features": (
+                wavlm_aligned if self.use_beats_time_anchor else None
+            ),
+            "crnn_aligned_to_beats_features": (
+                crnn_aligned if self.use_beats_time_anchor else None
+            ),
             "crnn_projected_features": fusion_outputs["crnn_projected"],
             "beats_projected_features": fusion_outputs["beats_projected"],
             "wavlm_projected_features": fusion_outputs["wavlm_projected"],
             "crnn_normalized_features": fusion_outputs["crnn_normalized"],
             "beats_normalized_features": fusion_outputs["beats_normalized"],
             "wavlm_normalized_features": fusion_outputs["wavlm_normalized"],
+            "ssl_main_normalized_features": fusion_outputs["ssl_main_normalized"],
             "fusion_gate_crnn": fusion_outputs["gate_crnn"],
             "fusion_gate_wavlm": fusion_outputs["gate_wavlm"],
+            "fusion_alpha_crnn": fusion_outputs["alpha_crnn"],
+            "fusion_alpha_wavlm": fusion_outputs["alpha_wavlm"],
+            "fused_ssl_sequence_features": fusion_outputs["fused_ssl"],
             "fused_sequence_features": fusion_outputs["fused"],
+            "final_fused_sequence_features": fusion_outputs["fused_output"],
         }
 
         if return_intermediates:
             outputs["encoder_frontend_features"] = cnn_outputs.get("frontend_features")
+            outputs["beats_frontend_features"] = beats_outputs.get("frontend_features")
+            outputs["wavlm_frontend_features"] = wavlm_outputs.get("frontend_features")
             outputs["decoder_inputs"] = decoder_outputs.get("decoder_inputs")
             outputs["decoder_frame_features"] = decoder_outputs.get("frame_features")
             outputs["attention_weights"] = decoder_outputs.get("attention_weights")
+            outputs["gate_crnn_inputs"] = fusion_outputs["gate_crnn_inputs"]
+            outputs["gate_wavlm_inputs"] = fusion_outputs["gate_wavlm_inputs"]
 
         return outputs

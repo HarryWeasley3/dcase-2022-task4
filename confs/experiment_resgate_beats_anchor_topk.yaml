@@ -1,0 +1,168 @@
+training:
+  synth_only: true
+  batch_size: 8
+  batch_size_val: 8
+  num_workers: 4
+  accumulate_batches: 1
+  n_epochs_warmup: 10
+  n_epochs: 120
+  early_stop_patience: 20
+  precision: 32
+  backend: null
+  gradient_clip: 1.0
+  checkpoint_top_k: 5
+  checkpoint_save_last: true
+  const_max: 0.5
+  median_window: 7
+  val_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]
+  n_test_thresholds: 50
+  ema_factor: 0.999
+  self_sup_loss: mse
+  validation_interval: 1
+  weak_split: 0.9
+  seed: 42
+  mixup: soft
+  obj_metric_synth_type: intersection
+
+scaler:
+  statistic: instance
+  normtype: minmax
+  dims: [1, 2]
+  savepath: ./scaler.ckpt
+
+data:
+  synth_folder: "./runtime_data/dcase_synth/audio/train/synthetic21_train/soundscapes_16k"
+  synth_folder_44k: ""
+  synth_tsv: "./runtime_data/dcase_synth/metadata/train/synthetic21_train/soundscapes.tsv"
+  strong_folder: ""
+  strong_folder_44k: ""
+  strong_tsv: ""
+  weak_folder: ""
+  weak_folder_44k: ""
+  weak_tsv: ""
+  unlabeled_folder: ""
+  unlabeled_folder_44k: ""
+  synth_val_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
+  synth_val_folder_44k: ""
+  synth_val_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  synth_val_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
+  test_folder: "./runtime_data/dcase_synth/audio/validation/synthetic21_validation/soundscapes_16k"
+  test_folder_44k: ""
+  test_tsv: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
+  test_dur: "./runtime_data/dcase_synth/metadata/validation/synthetic21_validation/durations.tsv"
+  eval_folder: ""
+  eval_folder_44k: ""
+  audio_max_len: 10
+  fs: 16000
+  net_subsample: 4
+
+opt:
+  lr: 0.000015
+  scheduler: warmup_cosine
+  min_lr: 0.000001
+  decay_power: 0.6
+  param_groups:
+    enable: true
+    lr_beats: 0.000005
+    lr_wavlm: 0.0000075
+    lr_crnn: 0.000010
+    lr_fusion: 0.000030
+    lr_decoder: 0.000020
+
+feats:
+  n_mels: 128
+  n_filters: 2048
+  hop_length: 256
+  n_window: 2048
+  sample_rate: 16000
+  f_min: 0
+  f_max: 8000
+
+net:
+  dropout: 0.5
+  rnn_layers: 2
+  n_in_channel: 1
+  nclass: 10
+  attention: true
+  n_RNN_cell: 128
+  activation: glu
+  rnn_type: BGRU
+  kernel_size: [3, 3, 3, 3, 3, 3, 3]
+  padding: [1, 1, 1, 1, 1, 1, 1]
+  stride: [1, 1, 1, 1, 1, 1, 1]
+  nb_filters: [16, 32, 64, 128, 128, 128, 128]
+  pooling: [[2, 2], [2, 2], [1, 2], [1, 2], [1, 2], [1, 2], [1, 2]]
+  dropout_recurrent: 0
+
+model:
+  align:
+    method: interpolate
+    interpolate_mode: linear
+
+  branches:
+    crnn:
+      enabled: true
+      train: true
+      warmstart:
+        enable: true
+        checkpoint: "./pretrained/crnn/crnn_best.pt"
+    beats:
+      enabled: true
+      pretrained_checkpoint: "./pretrained/beats/BEATs_iter3+_AS2M.pt"
+      freeze: false
+      feature_layer: null
+      fbank_mean: 15.41663
+      fbank_std: 6.55582
+      warmstart:
+        enable: true
+        checkpoint: "./pretrained/beats/BEATs_full_finetune_best_0_78.pt"
+    wavlm:
+      enabled: true
+      pretrained_checkpoint: "./pretrained/wavlm/WavLM-Base+.pt"
+      bundle_name: "WAVLM_BASE_PLUS"
+      freeze: false
+      output_layer: null
+      use_bundle_weights: true
+      normalize_waveform: false
+      warmstart:
+        enable: false
+        checkpoint: ""
+
+  fusion:
+    strategy: residual_gated
+    fusion_type: beats_main_residual_gated
+    main_branch: auto
+    residual_gated:
+      align_method: adaptive_avg
+      interpolate_mode: linear
+      use_beats_time_anchor: true
+      stopgrad_gate_inputs: true
+      fuse_dim: 256
+      norm_type: layernorm
+      gate_mode: channel
+      gate_hidden_dim: 256
+      gate_activation: gelu
+      gate_dropout: 0.3
+      use_post_fusion_proj: true
+      post_fusion_dim: 256
+      post_fusion_dropout: 0.3
+      use_alpha_scale: true
+      alpha_init: 0.2
+
+  decoder:
+    input_proj_dim: null
+    use_gru: true
+    hidden_dim: 128
+    rnn_layers: 2
+    dropout: 0.5
+    dropout_recurrent: 0
+    attention: true
+
+  decoder_warmstart:
+    enable: false
+    checkpoint: ""
+
+  teacher:
+    share_frozen_encoder: false
+    share_frozen_beats: false
+    share_frozen_wavlm: false

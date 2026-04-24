@@ -14,7 +14,6 @@ from desed_task.dataio import ConcatDatasetBatchSampler
 from desed_task.dataio.datasets import (StronglyAnnotatedSet, UnlabeledSet,
                                         WeakSet)
 from desed_task.utils.encoder import ManyHotEncoder
-from desed_task.utils.schedulers import ExponentialWarmup, WarmupCosineScheduler
 from local.classes_dict import classes_labels
 from local.resample_folder import resample_folder
 from local.sed_trainer import SEDTask4
@@ -76,6 +75,36 @@ def load_experiment_config(conf_file):
     return _resolve_profiles(configs)
 
 
+def build_eval_config_from_checkpoint(checkpoint, override_config):
+    """Reuse the checkpoint hyper-parameters while allowing data-path overrides."""
+    configs_ckpt = deepcopy(checkpoint["hyper_parameters"])
+    if "data" in override_config:
+        configs_ckpt["data"] = deepcopy(override_config["data"])
+
+    if "training" in override_config:
+        configs_ckpt.setdefault("training", {})
+        for key in (
+            "batch_size_val",
+            "num_workers",
+            "median_window",
+            "n_test_thresholds",
+            "val_thresholds",
+            "precision",
+            "backend",
+            "synth_only",
+        ):
+            if key in override_config["training"]:
+                configs_ckpt["training"][key] = override_config["training"][key]
+
+    if "scaler" in override_config:
+        configs_ckpt["scaler"] = deepcopy(override_config["scaler"])
+
+    if "log_dir" in override_config:
+        configs_ckpt["log_dir"] = override_config["log_dir"]
+
+    return configs_ckpt
+
+
 class _NoOpScheduler:
     def __init__(self, optimizer):
         self.optimizer = optimizer
@@ -86,6 +115,321 @@ class _NoOpScheduler:
 
     def step(self):
         self.step_num += 1
+
+    def state_dict(self):
+        return {"step_num": self.step_num}
+
+    def load_state_dict(self, state_dict):
+        self.step_num = int(state_dict.get("step_num", 0))
+
+
+class _GroupAwareExponentialWarmup:
+    """Exponential warmup that preserves per-group learning-rate ratios."""
+
+    def __init__(self, optimizer, rampup_length, exponent=-5.0):
+        self.optimizer = optimizer
+        self.rampup_len = rampup_length
+        self.exponent = exponent
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.step_num = 1
+
+    def _get_scaling_factor(self):
+        if self.rampup_len == 0:
+            return 1.0
+        current = np.clip(self.step_num, 0.0, self.rampup_len)
+        phase = 1.0 - current / self.rampup_len
+        return float(np.exp(self.exponent * phase * phase))
+
+    def _compute_group_lrs(self):
+        factor = self._get_scaling_factor()
+        return [base_lr * factor for base_lr in self.base_lrs]
+
+    def step(self):
+        for group, lr in zip(self.optimizer.param_groups, self._compute_group_lrs()):
+            group["lr"] = float(lr)
+        self.step_num += 1
+
+    def state_dict(self):
+        return {"step_num": self.step_num}
+
+    def load_state_dict(self, state_dict):
+        self.step_num = int(state_dict.get("step_num", 1))
+        for group, lr in zip(self.optimizer.param_groups, self._compute_group_lrs()):
+            group["lr"] = float(lr)
+
+
+class _GroupAwareWarmupCosineScheduler(_GroupAwareExponentialWarmup):
+    """Warmup + cosine decay scheduler that keeps per-group lr ratios."""
+
+    def __init__(
+        self,
+        optimizer,
+        rampup_length,
+        total_steps,
+        min_lr=1e-6,
+        exponent=-5.0,
+        decay_power=1.0,
+    ):
+        super().__init__(optimizer, rampup_length=rampup_length, exponent=exponent)
+        self.total_steps = max(int(total_steps), 1)
+        self.min_lr = float(min_lr)
+        self.decay_power = float(decay_power)
+        if self.decay_power <= 0.0:
+            raise ValueError(
+                f"Warmup cosine decay_power must be > 0, got {decay_power}."
+            )
+
+        max_base_lr = max(self.base_lrs) if self.base_lrs else 0.0
+        if max_base_lr <= 0.0:
+            self.min_lrs = [self.min_lr for _ in self.base_lrs]
+        else:
+            self.min_lrs = [
+                min(base_lr, self.min_lr * (base_lr / max_base_lr))
+                for base_lr in self.base_lrs
+            ]
+
+    def _compute_group_lrs(self):
+        if self.rampup_len == 0 or self.step_num <= self.rampup_len:
+            return super()._compute_group_lrs()
+
+        if self.total_steps <= self.rampup_len:
+            return list(self.base_lrs)
+
+        decay_step = min(self.step_num, self.total_steps)
+        progress = (decay_step - self.rampup_len) / (
+            self.total_steps - self.rampup_len
+        )
+        shaped_progress = progress ** self.decay_power
+        cosine = 0.5 * (1.0 + np.cos(np.pi * shaped_progress))
+        return [
+            float(min_lr + (base_lr - min_lr) * cosine)
+            for base_lr, min_lr in zip(self.base_lrs, self.min_lrs)
+        ]
+
+
+def _resolve_group_lr(group_name, opt_cfg):
+    param_groups_cfg = opt_cfg.get("param_groups", {})
+    default_lr = float(opt_cfg["lr"])
+    group_key_mapping = {
+        "beats_encoder": "lr_beats",
+        "wavlm_encoder": "lr_wavlm",
+        "crnn_encoder": "lr_crnn",
+        "fusion": "lr_fusion",
+        "decoder": "lr_decoder",
+    }
+    lr_key = group_key_mapping.get(group_name)
+    if lr_key is None:
+        return default_lr
+    return float(param_groups_cfg.get(lr_key, default_lr))
+
+
+def _collect_group_parameters(modules, seen_param_ids):
+    params = []
+    tensor_count = 0
+    total_numel = 0
+    for module in modules:
+        if not isinstance(module, torch.nn.Module):
+            continue
+        for parameter in module.parameters():
+            if not parameter.requires_grad or id(parameter) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(parameter))
+            params.append(parameter)
+            tensor_count += 1
+            total_numel += parameter.numel()
+    return params, tensor_count, total_numel
+
+
+def _build_optimizer_groups(model, opt_cfg):
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if len(trainable_parameters) == 0:
+        raise RuntimeError(
+            "No trainable parameters were found for the selected encoder/decoder setup."
+        )
+
+    param_groups_cfg = opt_cfg.get("param_groups", {})
+    if not param_groups_cfg.get("enable", False):
+        return trainable_parameters, None
+
+    module_groups = []
+    encoder_type = getattr(model, "encoder_type", None)
+
+    if hasattr(model, "beats_encoder"):
+        module_groups.append(("beats_encoder", [model.beats_encoder]))
+    elif encoder_type == "beats" and hasattr(model, "encoder"):
+        module_groups.append(("beats_encoder", [model.encoder]))
+
+    if hasattr(model, "wavlm_encoder"):
+        module_groups.append(("wavlm_encoder", [model.wavlm_encoder]))
+    elif encoder_type == "wavlm" and hasattr(model, "encoder"):
+        module_groups.append(("wavlm_encoder", [model.encoder]))
+
+    if hasattr(model, "crnn_encoder"):
+        module_groups.append(("crnn_encoder", [model.crnn_encoder]))
+    elif encoder_type == "crnn" and hasattr(model, "encoder"):
+        module_groups.append(("crnn_encoder", [model.encoder]))
+
+    fusion_modules = []
+    for attr_name in (
+        "fusion_block",
+        "merge_mlp",
+        "ssl_fusion_block",
+        "final_fusion_aligner",
+        "fusion_aligner",
+        "cnn_pre_fusion_norm",
+        "ssl_pre_fusion_norm",
+    ):
+        module = getattr(model, attr_name, None)
+        if isinstance(module, torch.nn.Module):
+            fusion_modules.append(module)
+    if fusion_modules:
+        module_groups.append(("fusion", fusion_modules))
+
+    if hasattr(model, "decoder"):
+        module_groups.append(("decoder", [model.decoder]))
+
+    optimizer_groups = []
+    group_summaries = []
+    seen_param_ids = set()
+    for group_name, modules in module_groups:
+        params, tensor_count, total_numel = _collect_group_parameters(
+            modules, seen_param_ids
+        )
+        if not params:
+            continue
+        group_lr = _resolve_group_lr(group_name, opt_cfg)
+        optimizer_groups.append(
+            {
+                "name": group_name,
+                "params": params,
+                "lr": group_lr,
+            }
+        )
+        group_summaries.append(
+            {
+                "name": group_name,
+                "lr": group_lr,
+                "tensor_count": tensor_count,
+                "numel": total_numel,
+            }
+        )
+
+    remaining_params = []
+    remaining_numel = 0
+    remaining_tensor_count = 0
+    for parameter in trainable_parameters:
+        if id(parameter) in seen_param_ids:
+            continue
+        remaining_params.append(parameter)
+        remaining_tensor_count += 1
+        remaining_numel += parameter.numel()
+        seen_param_ids.add(id(parameter))
+    if remaining_params:
+        default_lr = float(opt_cfg["lr"])
+        optimizer_groups.append(
+            {
+                "name": "remaining",
+                "params": remaining_params,
+                "lr": default_lr,
+            }
+        )
+        group_summaries.append(
+            {
+                "name": "remaining",
+                "lr": default_lr,
+                "tensor_count": remaining_tensor_count,
+                "numel": remaining_numel,
+            }
+        )
+
+    if not optimizer_groups:
+        return trainable_parameters, None
+
+    return optimizer_groups, group_summaries
+
+
+def _log_optimizer_groups(group_summaries):
+    if not group_summaries:
+        return
+    print("[optimizer] grouped parameter summary:")
+    total_numel = 0
+    for group_summary in group_summaries:
+        total_numel += int(group_summary["numel"])
+        print(
+            "  - {name}: lr={lr:.8f}, tensors={tensor_count}, params={numel}".format(
+                **group_summary
+            )
+        )
+    print(f"[optimizer] total trainable parameters: {total_numel}")
+
+
+def _build_optimizer(sed_student, config):
+    optimizer_groups, group_summaries = _build_optimizer_groups(
+        sed_student, config["opt"]
+    )
+    if isinstance(optimizer_groups, list) and optimizer_groups and isinstance(
+        optimizer_groups[0], dict
+    ):
+        _log_optimizer_groups(group_summaries)
+        return torch.optim.Adam(optimizer_groups, betas=(0.9, 0.999))
+
+    return torch.optim.Adam(
+        optimizer_groups,
+        float(config["opt"]["lr"]),
+        betas=(0.9, 0.999),
+    )
+
+
+def _build_lr_scheduler(config, optimizer, epoch_len):
+    exp_steps = config["training"]["n_epochs_warmup"] * epoch_len
+    scheduler_name = config["opt"].get("scheduler", "exponential_warmup")
+    if scheduler_name in (None, "exponential_warmup", "exp_warmup"):
+        scheduler_impl = _GroupAwareExponentialWarmup(
+            optimizer,
+            rampup_length=exp_steps,
+        )
+    elif scheduler_name in ("warmup_cosine", "cosine"):
+        total_steps = config["training"]["n_epochs"] * epoch_len
+        scheduler_impl = _GroupAwareWarmupCosineScheduler(
+            optimizer,
+            rampup_length=exp_steps,
+            total_steps=total_steps,
+            min_lr=config["opt"].get("min_lr", 1e-6),
+            decay_power=config["opt"].get("decay_power", 1.0),
+        )
+    elif scheduler_name in ("none", "disabled", False):
+        scheduler_impl = _NoOpScheduler(optimizer)
+    else:
+        raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+
+    return {
+        "scheduler": scheduler_impl,
+        "interval": "step",
+    }
+
+
+def _build_training_callbacks(config, checkpoint_dir):
+    """Create validation callbacks while keeping checkpoint policy configurable."""
+    checkpoint_top_k = int(config["training"].get("checkpoint_top_k", 1))
+    return [
+        EarlyStopping(
+            monitor="val/obj_metric",
+            patience=config["training"]["early_stop_patience"],
+            verbose=True,
+            mode="max",
+        ),
+        ModelCheckpoint(
+            checkpoint_dir,
+            monitor="val/obj_metric",
+            save_top_k=checkpoint_top_k,
+            mode="max",
+            save_last=config["training"].get("checkpoint_save_last", True),
+            filename="{epoch:03d}-{step:06d}",
+            auto_insert_metric_name=False,
+        ),
+    ]
 
 
 def _build_trainer_kwargs(
@@ -255,6 +599,7 @@ def single_run(
     fast_dev_run=False,
     evaluation=False,
     synth_only=False,
+    return_test_results=False,
 ):
     """
     Running sound event detection baselin
@@ -401,60 +746,15 @@ def single_run(
                 ),
             )
 
-        trainable_parameters = [
-            parameter
-            for parameter in sed_student.parameters()
-            if parameter.requires_grad
-        ]
-        if len(trainable_parameters) == 0:
-            raise RuntimeError("No trainable parameters were found for the selected encoder/decoder setup.")
-        opt = torch.optim.Adam(
-            trainable_parameters, config["opt"]["lr"], betas=(0.9, 0.999)
-        )
-        exp_steps = config["training"]["n_epochs_warmup"] * epoch_len
-        scheduler_name = config["opt"].get("scheduler", "exponential_warmup")
-        if scheduler_name in (None, "exponential_warmup", "exp_warmup"):
-            scheduler_impl = ExponentialWarmup(opt, config["opt"]["lr"], exp_steps)
-        elif scheduler_name in ("warmup_cosine", "cosine"):
-            total_steps = config["training"]["n_epochs"] * epoch_len
-            scheduler_impl = WarmupCosineScheduler(
-                opt,
-                config["opt"]["lr"],
-                exp_steps,
-                total_steps,
-                min_lr=config["opt"].get("min_lr", 1e-6),
-                decay_power=config["opt"].get("decay_power", 1.0),
-            )
-        elif scheduler_name in ("none", "disabled", False):
-            scheduler_impl = _NoOpScheduler(opt)
-        else:
-            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
-
-        exp_scheduler = {
-            "scheduler": scheduler_impl,
-            "interval": "step",
-        }
+        opt = _build_optimizer(sed_student, config)
+        exp_scheduler = _build_lr_scheduler(config, opt, epoch_len)
         logger = TensorBoardLogger(
             os.path.dirname(config["log_dir"]),
             config["log_dir"].split("/")[-1],
         )
         print(f"experiment dir: {logger.log_dir}")
 
-        callbacks = [
-            EarlyStopping(
-                monitor="val/obj_metric",
-                patience=config["training"]["early_stop_patience"],
-                verbose=True,
-                mode="max",
-            ),
-            ModelCheckpoint(
-                logger.log_dir,
-                monitor="val/obj_metric",
-                save_top_k=1,
-                mode="max",
-                save_last=True,
-            ),
-        ]
+        callbacks = _build_training_callbacks(config, logger.log_dir)
     else:
         train_dataset = None
         valid_dataset = None
@@ -528,6 +828,11 @@ def single_run(
 
     desed_training.load_state_dict(test_state_dict)
     trainer.test(desed_training)
+    if return_test_results:
+        return {
+            "test_results": deepcopy(getattr(desed_training, "latest_test_results", {})),
+            "exp_dir": desed_training.exp_dir,
+        }
 
 
 if __name__ == "__main__":
@@ -611,9 +916,7 @@ if __name__ == "__main__":
     if test_from_checkpoint is not None:
         map_location = None if torch.cuda.is_available() else torch.device("cpu")
         checkpoint = _torch_load_compat(test_from_checkpoint, map_location=map_location)
-        configs_ckpt = checkpoint["hyper_parameters"]
-        configs_ckpt["data"] = configs["data"]
-        configs = configs_ckpt
+        configs = build_eval_config_from_checkpoint(checkpoint, configs)
         print(
             f"loaded model: {test_from_checkpoint} \n"
             f"at epoch: {checkpoint['epoch']}"

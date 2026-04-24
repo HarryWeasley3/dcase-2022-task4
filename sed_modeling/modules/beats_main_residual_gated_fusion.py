@@ -12,7 +12,19 @@ def _build_activation(name):
 
 
 class BEATsMainResidualGatedFusion(nn.Module):
-    """Three-way residual gated fusion with a BEATs main path."""
+    """Three-way residual gated fusion with a BEATs main path.
+
+    Two forward modes are supported:
+
+    1. Legacy mode: align every branch to the CRNN timeline and fuse BEATs, CRNN,
+       and WavLM in one step.
+    2. BEATs time-anchor mode: keep BEATs on its native time grid, first fuse
+       BEATs(main) + WavLM(aux) on the BEATs grid, then inject aligned CRNN
+       features as a second residual correction.
+
+    ``stopgrad_gate_inputs`` only detaches the controller inputs seen by the gate
+    MLPs. The residual fusion path itself keeps normal gradients.
+    """
 
     def __init__(
         self,
@@ -30,6 +42,8 @@ class BEATsMainResidualGatedFusion(nn.Module):
         use_alpha_scale=False,
         alpha_init=1.0,
         gate_bias_init=-1.5,
+        stopgrad_gate_inputs=False,
+        use_beats_time_anchor=False,
     ):
         super().__init__()
         self.gate_mode = gate_mode.lower()
@@ -37,6 +51,8 @@ class BEATsMainResidualGatedFusion(nn.Module):
             raise ValueError(
                 f"Unsupported gate_mode: {gate_mode}. Expected 'channel' or 'frame'."
             )
+        self.stopgrad_gate_inputs = bool(stopgrad_gate_inputs)
+        self.use_beats_time_anchor = bool(use_beats_time_anchor)
 
         self.beats_proj = (
             nn.Identity()
@@ -57,6 +73,7 @@ class BEATsMainResidualGatedFusion(nn.Module):
         self.beats_norm = nn.LayerNorm(fuse_dim)
         self.crnn_norm = nn.LayerNorm(fuse_dim)
         self.wavlm_norm = nn.LayerNorm(fuse_dim)
+        self.ssl_main_norm = nn.LayerNorm(fuse_dim)
 
         gate_hidden_dim = gate_hidden_dim or fuse_dim
         gate_output_dim = fuse_dim if self.gate_mode == "channel" else 1
@@ -106,6 +123,22 @@ class BEATsMainResidualGatedFusion(nn.Module):
             self.post_fusion_proj = nn.Identity()
         self.output_dim = output_dim if use_post_fusion_proj else fuse_dim
 
+    def _maybe_detach_gate_input(self, tensor):
+        if self.stopgrad_gate_inputs:
+            return tensor.detach()
+        return tensor
+
+    def _compute_gate(self, gate_net, main_features, aux_features):
+        gate_inputs = torch.cat(
+            [
+                self._maybe_detach_gate_input(main_features),
+                self._maybe_detach_gate_input(aux_features),
+            ],
+            dim=-1,
+        )
+        gate = torch.sigmoid(gate_net(gate_inputs))
+        return gate, gate_inputs
+
     @staticmethod
     def _build_gate_net(
         fuse_dim,
@@ -135,17 +168,26 @@ class BEATsMainResidualGatedFusion(nn.Module):
         crnn_normalized = self.crnn_norm(crnn_projected)
         wavlm_normalized = self.wavlm_norm(wavlm_projected)
 
-        gate_crnn_inputs = torch.cat([beats_normalized, crnn_normalized], dim=-1)
-        gate_wavlm_inputs = torch.cat([beats_normalized, wavlm_normalized], dim=-1)
-
-        gate_crnn = torch.sigmoid(self.crnn_gate_net(gate_crnn_inputs))
-        gate_wavlm = torch.sigmoid(self.wavlm_gate_net(gate_wavlm_inputs))
-
-        fused = (
-            beats_normalized
-            + self.alpha_crnn * gate_crnn * crnn_normalized
-            + self.alpha_wavlm * gate_wavlm * wavlm_normalized
+        gate_wavlm, gate_wavlm_inputs = self._compute_gate(
+            self.wavlm_gate_net,
+            beats_normalized,
+            wavlm_normalized,
         )
+
+        fused_ssl = beats_normalized + self.alpha_wavlm * gate_wavlm * wavlm_normalized
+
+        if self.use_beats_time_anchor:
+            crnn_gate_main = self.ssl_main_norm(fused_ssl)
+        else:
+            crnn_gate_main = beats_normalized
+
+        gate_crnn, gate_crnn_inputs = self._compute_gate(
+            self.crnn_gate_net,
+            crnn_gate_main,
+            crnn_normalized,
+        )
+
+        fused = fused_ssl + self.alpha_crnn * gate_crnn * crnn_normalized
         fused_output = self.post_fusion_proj(fused)
 
         return {
@@ -155,8 +197,14 @@ class BEATsMainResidualGatedFusion(nn.Module):
             "beats_normalized": beats_normalized,
             "crnn_normalized": crnn_normalized,
             "wavlm_normalized": wavlm_normalized,
+            "ssl_main_normalized": crnn_gate_main,
+            "gate_crnn_inputs": gate_crnn_inputs,
+            "gate_wavlm_inputs": gate_wavlm_inputs,
             "gate_crnn": gate_crnn,
             "gate_wavlm": gate_wavlm,
+            "alpha_crnn": self.alpha_crnn,
+            "alpha_wavlm": self.alpha_wavlm,
+            "fused_ssl": fused_ssl,
             "fused": fused,
             "fused_output": fused_output,
         }

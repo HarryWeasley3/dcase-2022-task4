@@ -382,6 +382,8 @@ def resolve_model_config(config):
             "fusion_type": "concat",
             "align_method": "adaptive_avg",
             "interpolate_mode": "linear",
+            "use_beats_time_anchor": False,
+            "stopgrad_gate_inputs": False,
             "merge_mlp_dim": 256,
             "merge_activation": "gelu",
             "merge_dropout": net_cfg.get("dropout", 0.5),
@@ -1132,6 +1134,8 @@ def build_sed_model(config):
             post_fusion_dropout=fusion_cfg.get("post_fusion_dropout", 0.5),
             use_alpha_scale=fusion_cfg.get("use_alpha_scale", False),
             alpha_init=fusion_cfg.get("alpha_init", 1.0),
+            stopgrad_gate_inputs=fusion_cfg.get("stopgrad_gate_inputs", False),
+            use_beats_time_anchor=fusion_cfg.get("use_beats_time_anchor", False),
         )
         model = CRNNBEATsWavLMResidualGatedFusionModel(
             crnn_encoder=crnn_encoder,
