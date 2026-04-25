@@ -32,6 +32,7 @@ profiles:
         main_branch: beats
         align_method: adaptive_avg
         interpolate_mode: linear
+        use_beats_time_anchor: true
         merge_mlp_dim: 256
         merge_activation: gelu
         merge_dropout: 0.5

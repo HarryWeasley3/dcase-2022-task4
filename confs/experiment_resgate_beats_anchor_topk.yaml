@@ -10,8 +10,8 @@ training:
   precision: 32
   backend: null
   gradient_clip: 1.0
-  checkpoint_top_k: 5
-  checkpoint_save_last: true
+  checkpoint_top_k: 1
+  checkpoint_save_last: false
   const_max: 0.5
   median_window: 7
   val_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]

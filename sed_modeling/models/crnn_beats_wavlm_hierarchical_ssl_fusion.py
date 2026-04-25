@@ -12,7 +12,7 @@ class CRNNBEATsWavLMHierarchicalSSLFusionModel(nn.Module):
                 -> BEATs selected SSL layers
                 -> WavLM selected SSL layers
                 -> hierarchical SSL fusion with BEATs as the main path
-                -> align fused SSL features to the CRNN timeline
+                -> optionally keep the BEATs/SSL timeline as the final anchor
                 -> concat(CRNN, fused SSL) -> Merge MLP -> shared decoder
     """
 
@@ -29,6 +29,7 @@ class CRNNBEATsWavLMHierarchicalSSLFusionModel(nn.Module):
         beats_layers,
         wavlm_layers,
         use_branch_layernorm=False,
+        use_beats_time_anchor=False,
         build_config=None,
     ):
         super().__init__()
@@ -56,6 +57,7 @@ class CRNNBEATsWavLMHierarchicalSSLFusionModel(nn.Module):
             )
         self.encoder_type = "crnn_beats_wavlm_hierarchical_ssl_fusion"
         self.use_branch_layernorm = use_branch_layernorm
+        self.use_beats_time_anchor = bool(use_beats_time_anchor)
         self.build_config = deepcopy(build_config) if build_config is not None else None
 
         if use_branch_layernorm:
@@ -176,11 +178,18 @@ class CRNNBEATsWavLMHierarchicalSSLFusionModel(nn.Module):
             wavlm_selected_features=wavlm_selected_features,
         )
         fused_ssl_features = ssl_outputs["fused_ssl_output"]
-        fused_ssl_aligned = self.final_fusion_aligner(fused_ssl_features, cnn_features)
+        if self.use_beats_time_anchor:
+            # The hierarchical SSL block emits features on the selected BEATs
+            # stage timeline, so CRNN is the branch that should move here.
+            crnn_final_features = self.final_fusion_aligner(cnn_features, fused_ssl_features)
+            fused_ssl_aligned = fused_ssl_features
+        else:
+            crnn_final_features = cnn_features
+            fused_ssl_aligned = self.final_fusion_aligner(fused_ssl_features, cnn_features)
 
         fused_features = torch.cat(
             [
-                self.cnn_pre_fusion_norm(cnn_features),
+                self.cnn_pre_fusion_norm(crnn_final_features),
                 self.ssl_pre_fusion_norm(fused_ssl_aligned),
             ],
             dim=-1,
@@ -197,10 +206,15 @@ class CRNNBEATsWavLMHierarchicalSSLFusionModel(nn.Module):
             "encoder_sequence_features": merged_features,
             "aligned_sequence_features": decoder_inputs,
             "crnn_sequence_features": cnn_features,
+            "use_beats_time_anchor": self.use_beats_time_anchor,
             "beats_sequence_features": beats_outputs["sequence_features"],
             "wavlm_sequence_features": wavlm_outputs["sequence_features"],
             "beats_selected_layers": beats_outputs.get("selected_layers"),
             "wavlm_selected_layers": wavlm_outputs.get("selected_layers"),
+            "crnn_final_fusion_features": crnn_final_features,
+            "crnn_aligned_to_beats_features": (
+                crnn_final_features if self.use_beats_time_anchor else None
+            ),
             "fused_ssl_sequence_features": fused_ssl_features,
             "fused_ssl_aligned_features": fused_ssl_aligned,
             "fused_sequence_features": fused_features,

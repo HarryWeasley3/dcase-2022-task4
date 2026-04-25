@@ -1218,6 +1218,7 @@ def build_sed_model(config):
             beats_layers=ssl_hierarchical_cfg.get("beats_layers", [8]),
             wavlm_layers=ssl_hierarchical_cfg.get("wavlm_layers", [8]),
             use_branch_layernorm=fusion_cfg.get("use_layernorm", False),
+            use_beats_time_anchor=fusion_cfg.get("use_beats_time_anchor", False),
             build_config=config,
         )
         _load_crnn_encoder_warmstart(model, model_cfg)
