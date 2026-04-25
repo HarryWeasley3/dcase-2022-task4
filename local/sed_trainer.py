@@ -32,6 +32,29 @@ def _build_multilabel_f1(num_labels):
         )
 
 
+def _is_nonempty_prediction_frame(frame):
+    return (
+        isinstance(frame, pd.DataFrame)
+        and not frame.empty
+        and not frame.dropna(how="all").empty
+    )
+
+
+def _append_prediction_frame(buffer, decoded):
+    """Append decoded event predictions without concatenating empty frames."""
+    if _is_nonempty_prediction_frame(buffer) and _is_nonempty_prediction_frame(decoded):
+        return pd.concat([buffer, decoded], ignore_index=True)
+    if _is_nonempty_prediction_frame(buffer):
+        return buffer
+    if _is_nonempty_prediction_frame(decoded):
+        return decoded.reset_index(drop=True)
+    if isinstance(decoded, pd.DataFrame) and len(decoded.columns) > 0:
+        return decoded.iloc[0:0].copy()
+    if isinstance(buffer, pd.DataFrame):
+        return buffer.iloc[0:0].copy()
+    return pd.DataFrame()
+
+
 class SEDTask4(pl.LightningModule):
     """Pytorch lightning module for the SED 2021 baseline
     Args:
@@ -561,9 +584,9 @@ class SEDTask4(pl.LightningModule):
             )
 
             for th in self.val_buffer_student_synth.keys():
-                self.val_buffer_student_synth[th] = pd.concat(
-                    [self.val_buffer_student_synth[th], decoded_student_strong[th]],
-                    ignore_index=True,
+                self.val_buffer_student_synth[th] = _append_prediction_frame(
+                    self.val_buffer_student_synth[th],
+                    decoded_student_strong[th],
                 )
 
             decoded_teacher_strong = batched_decode_preds(
@@ -574,9 +597,9 @@ class SEDTask4(pl.LightningModule):
                 thresholds=list(self.val_buffer_teacher_synth.keys()),
             )
             for th in self.val_buffer_teacher_synth.keys():
-                self.val_buffer_teacher_synth[th] = pd.concat(
-                    [self.val_buffer_teacher_synth[th], decoded_teacher_strong[th]],
-                    ignore_index=True,
+                self.val_buffer_teacher_synth[th] = _append_prediction_frame(
+                    self.val_buffer_teacher_synth[th],
+                    decoded_teacher_strong[th],
                 )
 
         return
@@ -712,9 +735,9 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_student.keys():
-            self.test_psds_buffer_student[th] = pd.concat(
-                [self.test_psds_buffer_student[th], decoded_student_strong[th]],
-                ignore_index=True,
+            self.test_psds_buffer_student[th] = _append_prediction_frame(
+                self.test_psds_buffer_student[th],
+                decoded_student_strong[th],
             )
 
         decoded_teacher_strong = batched_decode_preds(
@@ -726,9 +749,9 @@ class SEDTask4(pl.LightningModule):
         )
 
         for th in self.test_psds_buffer_teacher.keys():
-            self.test_psds_buffer_teacher[th] = pd.concat(
-                [self.test_psds_buffer_teacher[th], decoded_teacher_strong[th]],
-                ignore_index=True,
+            self.test_psds_buffer_teacher[th] = _append_prediction_frame(
+                self.test_psds_buffer_teacher[th],
+                decoded_teacher_strong[th],
             )
 
         # compute f1 score
@@ -740,9 +763,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_student_05_buffer = pd.concat(
-            [self.decoded_student_05_buffer, decoded_student_strong[0.5]],
-            ignore_index=True,
+        self.decoded_student_05_buffer = _append_prediction_frame(
+            self.decoded_student_05_buffer,
+            decoded_student_strong[0.5],
         )
 
         decoded_teacher_strong = batched_decode_preds(
@@ -753,9 +776,9 @@ class SEDTask4(pl.LightningModule):
             thresholds=[0.5],
         )
 
-        self.decoded_teacher_05_buffer = pd.concat(
-            [self.decoded_teacher_05_buffer, decoded_teacher_strong[0.5]],
-            ignore_index=True,
+        self.decoded_teacher_05_buffer = _append_prediction_frame(
+            self.decoded_teacher_05_buffer,
+            decoded_teacher_strong[0.5],
         )
 
     def on_test_epoch_end(self):
