@@ -1,5 +1,14 @@
+"""搜索 BEATs 分支的后处理阈值与中值滤波窗口，输出 PSDS / Event-F1 对比报告。
+
+用法示例：
+    python scripts/search_beats_postprocessing.py \
+        --config confs/experiment_unified.yaml \
+        --checkpoint exp/2022_baseline/version_9/epoch=27-step=23352.ckpt
+"""
+
 import os
 import sys
+from argparse import ArgumentParser
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig_codex")
@@ -10,7 +19,7 @@ import scipy.ndimage
 import torch
 import yaml
 
-ROOT = Path("/home/llxxll/pyProj/dcase-2022-task4")
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -26,16 +35,14 @@ from local.classes_dict import classes_labels
 from sed_modeling import build_sed_model
 
 
-CONFIG_PATH = ROOT / "confs/unified_beats_synth_only_d_drive.yaml"
-CHECKPOINT_PATH = ROOT / "exp/2022_baseline/version_9/epoch=27-step=23352.ckpt"
-GT_TSV = Path(
-    "/mnt/d/Downloads/Compressed/dcase_synth/metadata/validation/synthetic21_validation/soundscapes.tsv"
-)
+CONFIG_PATH = ROOT / "confs/experiment_unified.yaml"
+CHECKPOINT_PATH = None  # 由命令行 --checkpoint 指定
+GT_TSV = None  # 缺省时取配置中的 data.test_tsv
 OUT_DIR = ROOT / "comparison_reports"
 REPORT_PATH = OUT_DIR / "beats_postprocessing_search.md"
 CSV_PATH = OUT_DIR / "beats_postprocessing_search.csv"
 CACHE_DIR = OUT_DIR / "beats_postprocessing_cache"
-CACHE_PATH = CACHE_DIR / "beats_student_frame_probs_v9.npz"
+CACHE_PATH = CACHE_DIR / "beats_student_frame_probs.npz"
 
 # Coarse-but-stable grid for a first post-processing pass.
 THRESHOLD_GRID = [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
@@ -524,9 +531,49 @@ def build_markdown(
     return "\n".join(lines)
 
 
+def parse_args():
+    parser = ArgumentParser(
+        description="搜索后处理阈值与中值滤波窗口，并输出 PSDS / Event-F1 对比报告。"
+    )
+    parser.add_argument(
+        "--config",
+        default=str(ROOT / "confs/experiment_unified.yaml"),
+        help="实验配置 YAML。",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="待评估的训练 checkpoint（需包含 sed_student 或 state_dict）。",
+    )
+    parser.add_argument(
+        "--gt-tsv",
+        default=None,
+        help="验证集强标签 TSV；缺省时取配置中的 data.test_tsv。",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=str(ROOT / "comparison_reports"),
+        help="报告、CSV 与缓存的输出目录。",
+    )
+    return parser.parse_args()
+
+
 def main():
+    global CONFIG_PATH, CHECKPOINT_PATH, GT_TSV, OUT_DIR
+    global REPORT_PATH, CSV_PATH, CACHE_DIR, CACHE_PATH
+
+    args = parse_args()
+    CONFIG_PATH = Path(args.config)
+    CHECKPOINT_PATH = Path(args.checkpoint)
+    OUT_DIR = Path(args.out_dir)
+    REPORT_PATH = OUT_DIR / "beats_postprocessing_search.md"
+    CSV_PATH = OUT_DIR / "beats_postprocessing_search.csv"
+    CACHE_DIR = OUT_DIR / "beats_postprocessing_cache"
+    CACHE_PATH = CACHE_DIR / "beats_student_frame_probs.npz"
+
     ensure_dirs()
     config = load_config()
+    GT_TSV = Path(args.gt_tsv) if args.gt_tsv else Path(config["data"]["test_tsv"])
     encoder = build_encoder(config)
     gt_df = pd.read_csv(GT_TSV, sep="\t")
     filenames, scores = infer_frame_probabilities(config)
