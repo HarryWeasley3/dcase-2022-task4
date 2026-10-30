@@ -1,66 +1,35 @@
-# DCASE 2022 Task 4 复现依赖（安装步骤见 docs/reproduction.md）
+# DCASE 2022 Task 4 运行依赖
 #
-# 重要：论文表 2 记录的 PyTorch 是 2.7.1+cu128（CUDA 13.0 环境、RTX 5090 32GB），
-# 这类 CUDA wheel 需要先从 PyTorch 官方的 cu128 索引单独安装，再执行
-# `pip install -r requirements.txt`；否则 pip 可能用 PyPI 上的其它 CUDA 变体
-# 覆盖掉已经装好的 cu128 wheel。论文表 2 没有记录下列第三方库的具体版本，
-# 因此除仓库历史钉版外均给出宽松区间，尚未在干净环境逐项验证（见"需要确认"注释）。
+# RTX 5090 使用 cu128 构建。先从 PyTorch 官方索引安装配套的 torch 与
+# torchaudio，再安装本文件中的其余依赖：
+# pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# pip install -r requirements.txt
 
-# ---- 深度学习框架 ----
-# RTX 5090（Blackwell，sm_120）需要 cu128 及以上的 wheel；上界 2.8 只是避免跨
-# 大版本，若与 torchaudio 成对发布的 2.8 版本可用可以放宽（需要确认）。
+# 深度学习框架
 torch>=2.7,<2.8
 torchaudio>=2.7,<2.8
-
-# 代码通过 inspect.signature(pl.Trainer) 同时兼容 1.x（gpus/strategy/
-# resume_from_checkpoint）和 2.x（accelerator/devices/ckpt_path）两套 Trainer
-# 参数。仓库原钉版 pytorch-lightning==1.5.1 是上游 2021 年 DCASE baseline 的旧
-# 环境，与 PyTorch 2.7 的组合没有验证过，这里默认安装 2.x（需要确认）。
 pytorch-lightning>=2.0,<3.0
-
-# train_sed.py 使用 TensorBoardLogger，缺少 tensorboard 时 Lightning 会直接报错。
 tensorboard>=2.10
-
-# local/sed_trainer.py 使用 MultilabelF1Score 计算弱标签 F1，并对旧版 torchmetrics
-# 的 API 保留了回退分支。
 torchmetrics>=0.11
 
-# ---- SED / DESED 数据与评估栈 ----
-# 以下四项沿用仓库历史 requirements.txt 的钉版，属于上游 DCASE 2022 Task 4
-# baseline 的已知组合：dcase_util 提供 DecisionEncoder，desed 提供数据下载 API，
-# psds_eval / sed_eval 负责 PSDS 与 event/segment F1。这些包年代较早，在
-# Python 3.10 + 新版本 numpy/pandas 下能否顺利安装和运行需要确认。
+# SED 数据与评估
 dcase_util==0.2.16
 desed==1.3.6
 psds_eval>=0.4.0
 sed_eval==0.2.1
 
-# ---- 数据读取、配置、评估与运行时杂项（源码中都有直接 import） ----
+# 数据读取、配置与科学计算
 numpy>=1.23
 pandas>=1.3,<3
 pyyaml>=5.4
 tqdm>=4.62
 soundfile>=0.12
-# local/utils.py 仍在调用 scipy.ndimage.filters.median_filter 这个旧命名空间；
-# SciPy 在 1.15 系列移除了该命名空间（具体版本号需要确认），因此这里先限制上界。
 scipy>=1.7,<1.15
-# psds_eval 的绘图入口 plot_psd_roc 在 import 时可能间接需要 matplotlib，
-# 主要评估流程不直接绘图，但缺少该包可能导致导入失败。
 matplotlib>=3.5
 
-# ---- 训练器中的能耗统计与调度器依赖 ----
-# local/sed_trainer.py 在模块级 import codecarbon，并通过 tracker._total_energy.kwh
-# 读取能耗；仓库历史环境钉过 codecarbon==1.2.0，更新版本（2.x/3.x）对私有属性和
-# 构造参数的兼容性需要确认。
+# 能耗统计与调度器
 codecarbon>=1.2,<3
-# desed_task/utils/__init__.py 会 import .schedulers，后者执行
-# `from asteroid.engine.schedulers import *`，所以即使只训练 CRNN 也必须安装
-# asteroid；asteroid 0.6.0 是 2021 年的版本，与 PyTorch 2.7 的兼容性需要确认。
 asteroid>=0.6,<0.7
 
-# ---- 仅运行 tests/ 时需要（按需自行安装） ----
+# 测试
 # pytest>=7
-
-# 说明：原文件首行的 `-r ../../lint-requirements.txt` 指向仓库外不存在的文件，已移除；
-# 原文件中的 `pre-commit>=2.3.0` 属于上游 lint 配置，本仓库没有配套的 pre-commit 配置
-# 文件，因此不再列出。

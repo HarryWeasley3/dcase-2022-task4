@@ -1,110 +1,44 @@
-# CRNN + BEATs Residual Gated Fusion
+# 残差门控融合
 
-> **文档状态**：本文记录 2026-03 的设计阶段，保留作为工程决策的历史记录。当前实现见 `sed_modeling/modules/residual_gated_fusion.py` 与 [architecture.md](../architecture.md)。
+残差门控融合先将各分支映射到相同维度，再通过门控网络控制残差分支对主分支的贡献。该模块位于编码器与共享解码器之间。
 
-## 1. 目标
+## 1 双分支结构
 
-这一版不是 posterior fusion，也不是重新写一套训练框架，而是在当前已经跑通的 `CRNN + BEATs late fusion` 基础上，把：
+CRNN+BEATs 使用 BEATs 作为主分支。两路特征完成投影和 LayerNorm 后，融合形式为：
 
-`concat -> Merge MLP -> BiGRU`
+`fused = beats_norm + α · gate · cnn_norm`
 
-升级成更贴合诊断结论的：
+CRNN+WavLM 使用 WavLM 作为主分支：
 
-`projection + per-branch LayerNorm + gate + residual fusion -> BiGRU`
+`fused = wavlm_norm + α · gate · cnn_norm`
 
-核心思想是：
+其中，`α` 为可学习标量，`gate` 由主分支和残差分支共同生成。帧级门控的形状为 `[B, T, 1]`，计算时沿特征维广播；通道级门控的形状为 `[B, T, D]`。
 
-- `CRNN` 仍然是主干
-- `BEATs` 仍然是冻结的补充分支
-- 模型显式学习“每一帧 / 每一通道到底该让 BEATs 补多少”
+## 2 三分支结构
 
-## 2. 数据流
+三分支路由以 BEATs 作为时间与特征主路径。计算分为两步：
 
-### CRNN 分支
+1. 使用 WavLM 门控生成 `beats_norm + α_w · gate_w · wavlm_norm`。
+2. 将上一步结果与 CRNN 特征输入第二个门控网络，生成最终融合特征。
 
-`waveform -> log-mel -> scaler -> CNN -> cnn_feat [B, T_cnn, D_cnn]`
+第二个门控网络以已经融合 WavLM 的 BEATs 表征作为控制输入。CRNN 和 WavLM 使用独立门控与独立缩放系数。
 
-### BEATs 分支
+## 3 模块组成
 
-`waveform -> frozen BEATs -> beats_feat [B, T_beats, D_beats]`
+每个分支先经过线性投影和 LayerNorm。门控网络接收主分支与残差分支的拼接特征，并通过 sigmoid 输出权重。门控末层偏置初始化为 -1.5。融合结果可经过 `post_fusion_proj`，随后进入 `TimeAligner` 和共享 `SEDDecoder`。
 
-### 对齐
+`stop_gradient_on_gate_input` 仅阻断门控控制器输入的梯度。分支特征在残差计算中的梯度路径保持有效。
 
-先用 `FusionTimeAligner(method="adaptive_avg")` 把 `beats_feat` 对齐到 `T_cnn`：
+## 4 配置与运行
 
-`beats_aligned [B, T_cnn, D_beats]`
+在 `confs/experiment_unified.yaml` 中启用所需分支，并设置：
 
-### Residual Gated Fusion
+- `model.fusion.strategy: residual_gated`
+- `model.fusion.fusion_type: residual_gated`
+- `model.fusion.main_branch: auto`
 
-1. `cnn_feat -> cnn_proj -> cnn_norm`
-2. `beats_aligned -> beats_proj -> beats_norm`
-3. `gate = sigmoid(gate_net([cnn_norm ; beats_norm]))`
-4. `fused = cnn_norm + gate * beats_norm`
-5. `fused -> optional post_fusion_proj -> shared SEDDecoder`
-
-默认 gate 是按通道的，也就是输出 `[B, T, D_fuse]`。
-
-## 3. 为什么不用裸 concat
-
-之前的诊断已经说明：
-
-- `CRNN` 是主导分支
-- `BEATs` 不是没用，但更像弱补充通道
-- 裸 `concat` 会把两路特征无条件堆到一起
-- 后续 `MLP / BiGRU` 被迫自己学“该信谁”，控制粒度太粗
-
-Residual gated fusion 更适合当前这种“强主干 + 弱补充”的结构，因为：
-
-- 先做独立 projection + LayerNorm，可以缓解尺度不匹配
-- gate 可以逐帧 / 逐通道决定 BEATs 是否值得补进来
-- 残差式设计显式保住 CRNN 主路径，不让 BEATs 反客为主
-
-## 4. 和旧版 late fusion 的区别
-
-旧版：
-
-`CNN feat + BEATs aligned -> concat -> Merge MLP -> BiGRU -> heads`
-
-新版：
-
-`CNN feat / BEATs aligned -> independent proj + norm -> gate -> cnn + gate * beats -> optional post proj -> BiGRU -> heads`
-
-保留的部分：
-
-- CNN branch 后、BiGRU 前的融合位置
-- BEATs 先对齐到 CNN 时间长度
-- 共享 `SEDDecoder`
-- mean-teacher trainer / loss / 评估流程
-
-替换的部分：
-
-- 用 `ResidualGatedFusion` 替代旧的 `concat + Merge MLP`
-
-## 5. 运行方式
+`model.fusion.residual_gated.gate_mode` 控制帧级或通道级门控，`learnable_alpha` 控制缩放系数是否参与训练。
 
 ```bash
-python train_sed.py --conf_file ./confs/crnn_beats_residual_gated_fusion_synth_only.yaml --synth_only --gpus 1
+python train_sed.py --conf_file confs/experiment_unified.yaml --synth_only --gpus 1
 ```
-
-冒烟测试：
-
-```bash
-python train_sed.py --conf_file ./confs/crnn_beats_residual_gated_fusion_synth_only.yaml --synth_only --gpus 0 --fast_dev_run
-```
-
-## 6. 是否需要重新训练
-
-需要重新训练。
-
-原因是这次改的是模型内部融合模块，不是输出层后处理：
-
-- 新增了 projection + LayerNorm
-- 新增了 gate network
-- 改变了进入 BiGRU 的特征分布
-
-## 7. 当前限制
-
-- 当前仍是 `freeze BEATs` 版本
-- 还没有做 class-aware gate
-- 还没有做 attention / cross-attention 版融合
-- 还没有接 WavLM

@@ -1,37 +1,33 @@
 # 体系结构说明
 
-本文说明这个仓库的模型是怎么组装的：一段波形如何经过三个可互换的编码器、如何在时间轴上对齐、如何被融合、如何送入共享解码器输出帧级与片段级预测，以及 Mean-Teacher 训练框架为了支持多分支做了哪些改动。实验数字见 [实验结果](results.md)，环境与数据准备见 [复现说明](reproduction.md)，早期设计阶段的历史记录见 [design/](design/) 目录。
+本文说明模型的装配方式，包括三个可互换的编码器、时间对齐、特征融合、共享解码器和 Mean-Teacher 训练框架。实验数字见 [实验结果](results.md)，环境与数据准备见 [复现说明](reproduction.md)，各融合模块的详细说明见 [design/](design/) 目录。
 
 本文的每条结论都对应到仓库里的具体实现，涉及的源文件在文末「代码索引」一节集中列出。
 
 ## 1 设计目标
 
-这个仓库的出发点是一个关于"公平比较"的问题。DCASE 2022 Task 4 的官方基线把 Mel 前端、CNN、BiGRU 和强弱标签两个预测头全部写死在一个 CRNN 类里，想换掉前端表征就必须同时改训练流程、特征尺度和损失计算，任何一次替换都会把"表征差异"和"实现差异"混在一起。因此重构的第一个目标是把编码器从训练流程里剥出来：只要新编码器满足「波形进、序列特征出」这一条接口，训练、对齐、解码、后处理就全部复用。
+重构的目标是统一异构表征的接入方式。上游 CRNN 类包含 CNN、BiGRU 与强弱预测头，Mel 前端在训练流程中处理。当前框架将波形前端与编码器封装为统一接口，分离对齐、融合与解码，使分支替换能够复用训练、后处理与评估入口。
 
-第二个目标是让融合方式成为配置而不是新代码。三种分支组合（单分支、双分支、三分支）和三条融合路由（late、residual gated、hierarchical SSL）都通过 YAML 里的 `model.fusion.strategy` 与 `model.branches.*.enabled` 表达，`build_sed_model()` 负责把配置翻译成一个具体的模型对象。
+第二个目标是用配置表达融合方式。三种分支组合（单分支、双分支、三分支）和三条融合路由（late、residual gated、hierarchical SSL）都通过 YAML 里的 `model.fusion.strategy` 与 `model.branches.*.enabled` 表达，`build_sed_model()` 负责把配置翻译成一个具体的模型对象。
 
-第三个目标是保留可分析的中间量。多分支模型除了输出预测，还通过 forward 返回的字典暴露每一路的原始特征、对齐后特征、投影后特征、门控权重等十几个键，这样后续做表征分析、可视化与失败诊断时不需要改模型代码。
+第三个目标是保留可分析的中间量。多分支模型除了输出预测，还通过 forward 返回的字典提供各分支的原始特征、对齐后特征、投影后特征和门控权重。这些数据可用于表征分析、可视化和错误诊断。
 
 ## 2 数据流
 
 单编码器路径（只有一个分支启用时）最短：波形进入编码器得到 `[B, T_enc, D]` 的序列特征，经过 `TimeAligner` 对齐到标签栅格 `T_label`，再送入共享解码器得到 strong 与 weak 两个预测。
 
-多分支路径在编码器和解码器之间插入融合层，并且有两次对齐：一次发生在融合之前（把 SSL 分支的时间轴对齐到 CNN 的时间栅格），一次发生在融合之后（把融合表示对齐到标签栅格）。
+多分支路径在编码器和解码器之间插入融合层。融合参考时间轴由路由决定：late 融合以 CNN 为参考，三分支残差门控可通过 `use_beats_time_anchor` 切换到 BEATs 时间轴；层级 SSL 先在 BEATs 各层时间轴上融合，最后再按配置与 CNN 对齐。融合结果统一对齐至标签栅格。
 
 ```mermaid
 flowchart LR
     A["waveform<br/>[B, T]"] --> E1["CRNNEncoder<br/>log-mel + CNN"]
-    A --> E2["BEATsEncoder<br/>vendored BEATs"]
-    A --> E3["WavLMEncoder<br/>torchaudio bundle"]
-    E1 --> S1["[B, T1, D1]"]
-    E2 --> S2["[B, T2, D2]"]
-    E3 --> S3["[B, T3, D3]"]
-    S2 --> FA["FusionTimeAligner<br/>对齐到 CNN 时间栅格"]
-    S3 --> FA
-    S1 --> FU["融合模块<br/>late / residual gated / hierarchical SSL"]
-    FA --> FU
-    FU --> MLP["MergeMLP<br/>统一到 256 维"]
-    MLP --> AL["TimeAligner<br/>对齐到标签栅格 T_label"]
+    A --> E2["BEATsEncoder"]
+    A --> E3["WavLMEncoder"]
+    E1 --> FA["分支间时间对齐<br/>参考栅格由路由决定"]
+    E2 --> FA
+    E3 --> FA
+    FA --> FU["融合及维度映射<br/>拼接 / 残差门控 / 层级 SSL"]
+    FU --> AL["TimeAligner<br/>对齐至标签栅格"]
     AL --> DEC["SEDDecoder<br/>BiGRU + strong/weak heads"]
     DEC --> O1["strong_preds<br/>[B, C, T_label]"]
     DEC --> O2["weak_preds<br/>[B, C]"]
@@ -39,7 +35,7 @@ flowchart LR
 
 ## 3 三个编码器
 
-三个编码器对外暴露的契约完全一致：`forward(audio, padding_mask=None)` 返回一个字典，其中 `sequence_features` 的形状为 `[B, T, D]`，`frontend_features` 只在 CRNN 分支上存在（用于可视化 log-mel 输入）。`output_dim` 在构造时静态确定，融合模块据此决定投影层维度。
+三个编码器的 `forward(audio, padding_mask=None)` 均返回字典，`sequence_features` 为 `[B, T, D]`，`output_dim` 在构造时确定。`frontend_features` 在三种编码器中都可返回：CRNN 为归一化频谱，BEATs 为 fbank，WavLM 为输入处理后的波形；它们的形状和语义不同，不能按同一类频谱解释。
 
 | 编码器 | 输入 | 前端 | 输出维度 | 关键参数 |
 |---|---|---|---|---|
@@ -49,9 +45,9 @@ flowchart LR
 
 `CRNNEncoder` 基本沿用上游 CRNN 的前端：Mel 频谱经过 `AmplitudeToDB` 后裁剪到 `[-50, 80]` 区间，再由训练器注入的 `input_scaler` 做实例级 min-max 归一化，然后进入七层 CNN。卷积后如果频率维还没有压到 1，会把频率维折叠进特征维并给出一次 warning，这是为了在自定义 pooling 配置下仍能输出 `[B, T, D]` 而做的兜底。`train_cnn=False` 时整个 CNN 冻结，`freeze_bn=True` 时所有 BatchNorm 强制切到 eval 且不更新仿射参数。
 
-`BEATsEncoder` 使用仓库内 vendored 的最小官方实现（`sed_modeling/third_party/beats/`），只保留特征提取所需代码，从而避开 fairseq / hydra 这类重依赖。它有两种工作模式：`freeze=True` 时冻结全部参数并在 `no_grad` 下前向，作为特征提取器；`freeze=False` 时随主模型一起微调。编码器内部会按 BEATs 官方的 fbank 均值方差（`15.41663` / `6.55582`）做归一化，并在需要时取第 `feature_layer` 层的输出；为了支持层级融合，它还允许通过 `selected_layers` 一次返回多层 hidden states。BEATs 前向过程默认关闭 autocast，避免半精度下 Transformer 前向与官方实现产生数值差异。
+`BEATsEncoder` 使用仓库内 vendored 的最小官方实现（`sed_modeling/third_party/beats/`），只保留特征提取所需代码，从而避开 fairseq / hydra 这类重依赖。它有两种工作模式：`freeze=True` 时冻结全部参数并在 `no_grad` 下前向，作为特征提取器；`freeze=False` 时随主模型一起微调。编码器内部会按 BEATs 官方的 fbank 均值方差（`15.41663` / `6.55582`）做归一化，并在需要时取第 `feature_layer` 层的输出；为了支持层级融合，它还允许通过 `selected_layers` 一次返回多层 hidden states。冻结模式下，BEATs 前向同时使用 `no_grad` 并关闭 autocast；可训练模式不在编码器内强制关闭 autocast。
 
-`WavLMEncoder` 基于 `torchaudio.pipelines` 的 WavLM bundle 构建模型，支持两种权重来源：直接使用 bundle 自带权重（`use_bundle_weights=True`），或从自定义 checkpoint 加载。后者需要处理官方权重与 torchaudio 模型之间的前缀差异，代码里的 `_strip_prefixes` 会递归剥掉 `model.` / `state_dict.` / `module.` / `wavlm.` / `encoder.` 这几类前缀，`_extract_state_dict` 兼容 `model`、`state_dict` 与裸 state dict 三种容器形式。前向时把 `[B, T]` 的 padding mask 转换成 torchaudio 需要的 `lengths`，`normalize_waveform=True` 时会先对波形做 layer norm。
+`WavLMEncoder` 基于 `torchaudio.pipelines` 的 WavLM bundle 构建模型，支持两种权重来源：直接使用 bundle 自带权重（`use_bundle_weights=True`），或从自定义 checkpoint 加载。自定义 checkpoint 必须与 torchaudio 模型结构相容；前缀处理本身不保证 Microsoft fairseq 格式权重可直接兼容。代码里的 `_strip_prefixes` 会递归剥掉 `model.` / `state_dict.` / `module.` / `wavlm.` / `encoder.` 这几类前缀，`_extract_state_dict` 兼容 `model`、`state_dict` 与裸 state dict 三种容器形式。前向时把 `[B, T]` 的 padding mask 转换成 torchaudio 需要的 `lengths`，`normalize_waveform=True` 时会先对波形做 layer norm。
 
 ## 4 时间对齐
 
@@ -68,37 +64,33 @@ flowchart LR
 | `adaptive_avg` | `F.adaptive_avg_pool1d` | 把较长序列压缩到目标长度，避免直接截断丢信息 |
 | `adaptive_max` | `F.adaptive_max_pool1d` | 关注短时强响应（如瞬态事件）时 |
 
-`FusionTimeAligner` 继承自 `TimeAligner`，但接口换成"对齐到另一路序列"：`forward(sequence, reference)` 以 `reference.shape[1]` 作为目标长度。双分支与三分支的 late 融合都用它把 SSL 分支对齐到 CNN 分支的时间栅格，之后再拼接或门控。这两次对齐的职责被刻意分开：融合前的对齐保证"同一时间位置的异构特征可以逐元素比较"，融合后的对齐保证"输出与标签栅格对齐"。
+`FusionTimeAligner` 以 `reference.shape[1]` 为目标长度，对齐至另一路序列。late 融合通常将 SSL 特征对齐至 CNN 时间轴；启用 BEATs 时间锚点的三分支路由则将 WavLM 与 CNN 对齐至 BEATs。融合前的分支间对齐和融合后的标签栅格对齐承担不同职责。
 
 ## 5 融合
 
 ### 5.1 late 融合：拼接与整合
 
-late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接（`fusion_type: concat`）或直接相加（`fusion_type: add`），然后交给 `MergeMLP` 把维度映射到后续解码器可接收的统一空间。`MergeMLP` 是一个"Linear → 激活 → Dropout（→ 可选 LayerNorm）"的轻量映射层，输出维度由 `merge_mlp_dim`（默认 256）决定；它不承担筛选信息的职责，只负责把拼接后膨胀的特征压回可控维度，并把不同分支的特征混合到同一个表示空间。
+late 融合先对齐各路特征。双分支支持 `concat` 或 `add`，三分支 late 路由当前仅支持 `concat`。随后使用 `MergeMLP` 映射维度，其实际顺序为“Linear → 可选 LayerNorm → 激活 → Dropout”，输出维度由 `merge_mlp_dim` 控制。相加方式还要求分支维度相容，不能任意替换拼接。
 
 ![特征拼接结构](figures/fusion-concat.png)
 
-论文中与"特征拼接"并列的"固定式中层融合"在代码里没有独立的模型类，它落在同一条 late 路由上，通过融合位置与 MergeMLP 的配置差异表达；三种三分支融合方式的具体配置组合记录在论文实验日志中，仓库保留的是这条路由的全部可调项（见 [design/fusion-late.md](design/fusion-late.md)）。
-
-![固定式中层融合结构](figures/fusion-mid.png)
-
 ### 5.2 残差门控融合
 
-残差门控是这篇工作里最核心的设计。它不把两路特征对称地拼在一起，而是明确指定 BEATs 为主路径、CRNN 为修正分支，让新增信息以门控残差的形式叠加：`fused = beats_norm + α · gate · cnn_norm`，其中 `gate = sigmoid(gate_net([cnn_norm, beats_norm]))`。为了让两条来自不同表征空间的支路可比，两路特征先各自经过独立线性投影（`cnn_proj` / `beats_proj`）与分支 LayerNorm（`cnn_norm` / `beats_norm`），再拼接送入门控网络。门控网络的最后一层偏置初始化为 `-1.5`，于是训练初期 gate ≈ 0.18，模型基本等价于强分支本身，只有训练证明修正有效时门控才会打开；`use_alpha_scale=True` 时 α 也是可学习参数，否则是一个固定 buffer。门控有两种粒度：`gate_mode: channel` 输出与特征维同长的通道级权重，`gate_mode: frame` 只输出一个标量、由广播作用在时间维上。融合后的特征还可以经过一次 `post_fusion_proj`（Linear + LayerNorm + Dropout）再送进解码器。
+残差门控在独立投影与 LayerNorm 后融合两路特征。CRNN+BEATs 以 BEATs 为主路径，形式为 `fused = beats_norm + α · gate · cnn_norm`；CRNN+WavLM 以 WavLM 为主路径。通道级门控输出 `[B, T, D]`，帧级门控输出 `[B, T, 1]` 并沿特征维广播。门控网络的末层偏置初始化为 -1.5。`use_alpha_scale=True` 时，α 作为无范围约束的参数参与训练。融合结果可经过 `post_fusion_proj`，再进入标签对齐与解码器。
 
 ![残差门控融合结构](figures/fusion-residual-gated.png)
 
-参数集中在 `model.fusion.residual_gated` 下：`fuse_dim` 控制投影维度，`gate_hidden_dim` 控制门控网络隐层，`gate_activation` 支持 relu / gelu，`gate_dropout` 作用于门控网络，`use_post_fusion_proj` 与 `post_fusion_dim` 控制融合后投影。三分支版本把这个模块用两次：先以 CRNN+BEATs 的融合表示为主路径，再把 WavLM 作为第二个残差支路接入，从而保证新增分支始终只能"修正"而不能"重置"已有强表示。
+参数集中在 `model.fusion.residual_gated`。三分支由单个 `BEATsMainResidualGatedFusion` 模块实现：先计算 `fused_ssl = beats_norm + α_wavlm · gate_wavlm · wavlm_norm`，再加入 `α_crnn · gate_crnn · cnn_norm`。默认模式下两路门控均以 BEATs 特征作为主路径输入；启用 BEATs 时间锚点后，CRNN 门控改用归一化的 `fused_ssl` 作为主输入。该路由的 `stopgrad_gate_inputs` 只截断门控控制器输入的梯度，残差特征路径仍正常反向传播。
 
-### 5.3 hierarchical SSL 融合（论文之后的扩展）
+### 5.3 hierarchical SSL 融合
 
-论文完成之后，仓库继续尝试了一种层级融合：不再只取 BEATs 与 WavLM 的最后一层，而是同时取多个中间层（例如 `beats_layers: [5, 11]`、`wavlm_layers: [5, 11]`），以 BEATs 的时间轴为锚点逐层对齐后再做门控融合，并且可以选择对门控输入做 stop-gradient，避免弱分支的梯度反过来扰动强分支的中间表示。这部分对应 `strategy: hierarchical_ssl` 与 `model.ssl_hierarchical_fusion` 配置段，单元测试见 `tests/test_hierarchical_ssl_fusion.py`。它没有被纳入论文的对比表，属于后续工作，README 与 results 中不引用它的数字。
+层级 SSL 融合提取 BEATs 与 WavLM 的多个中间层，例如 `beats_layers: [5, 11]`、`wavlm_layers: [5, 11]`，在每个阶段以 BEATs 时间轴为参考对齐并融合。该模块支持 1 或 2 个阶段，随后将融合后的 SSL 表征与 CNN 特征拼接，经 MergeMLP 和标签对齐进入解码器。对应配置为 `strategy: hierarchical_ssl` 与 `model.ssl_hierarchical_fusion`，装配与形状检查见 `tests/test_hierarchical_ssl_fusion.py`。
 
 ## 6 解码器与预测头
 
 所有路由共用一个 `SEDDecoder`。它由四部分组成：可选的输入投影（`input_proj_dim`，与输入维度一致时退化为 `Identity`）、可选的时序模块（默认两层 BiGRU，`hidden_dim=128`，来自上游 `desed_task.nnet.RNN.BidirectionalGRU`）、Dropout、以及两个预测头。
 
-帧级头是一个 `Linear(head_dim → n_classes)`，输出经 sigmoid 得到 `strong_preds`，形状先把时间与类别维度转置成 `[B, C, T]`。片段级头有两种实现：`attention=True` 时用 `attention_head` 在时间维上算注意力权重（softmax 后做数值裁剪），再对 strong 概率加权平均得到 `weak_preds`，等价于注意力池化；`attention=False` 时直接对时间维取均值。解码器同时返回 `strong_logits`、`decoder_inputs`、`frame_features` 与 `attention_weights`，供训练时的损失计算和后续分析使用。
+帧级头是一个 `Linear(head_dim → n_classes)`，输出经 sigmoid 得到 `strong_preds`，形状先把时间与类别维度转置成 `[B, C, T]`。片段级头有两种实现：`attention=True` 时用 `attention_head` 在时间维上算注意力权重（softmax 后做数值裁剪），再对 strong 概率加权平均得到 `weak_preds`，等价于注意力池化；`attention=False` 时直接对时间维取均值。解码器同时返回 `strong_logits`、`decoder_inputs`、`frame_features` 与 `attention_weights`，用于损失计算和特征分析。
 
 ## 7 模型装配：`build_sed_model` 路由
 
@@ -115,17 +107,17 @@ late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接
 | CRNN + BEATs + WavLM | residual_gated | `crnn_beats_wavlm_residual_gated_fusion` | `CRNNBEATsWavLMResidualGatedFusionModel` |
 | CRNN + BEATs + WavLM | hierarchical_ssl | `crnn_beats_wavlm_hierarchical_ssl_fusion` | `CRNNBEATsWavLMHierarchicalSSLFusionModel` |
 
-这些模型类是"薄包装"：它们只负责按固定数据流调用编码器、融合对齐器、融合模块、标签对齐器与解码器，并把中间特征打包进输出字典；真正的计算都在 `encoders/`、`modules/` 与 `decoders/` 里。这样做的结果是，新增一种分支组合只需要写一个几十行的编排类，而不必复制训练逻辑。`residual_gated` 路由还会强制设置主分支：CRNN+BEATs 组合以 BEATs 为主，CRNN+WavLM 组合以 WavLM 为主，三分支组合以 BEATs 为主，并在配置里把 `fusion_type` 记为 `residual_gated` 或 `beats_main_residual_gated`。
+这些模型类采用轻量封装，只负责按固定数据流调用编码器、融合对齐器、融合模块、标签对齐器与解码器，并把中间特征打包进输出字典。主要计算位于 `encoders/`、`modules/` 与 `decoders/`。新增分支组合时，可以复用训练逻辑并添加对应的编排类。`residual_gated` 路由会设置主分支：CRNN+BEATs 组合以 BEATs 为主，CRNN+WavLM 组合以 WavLM 为主，三分支组合以 BEATs 为主，并在配置里把 `fusion_type` 记为 `residual_gated` 或 `beats_main_residual_gated`。
 
 此外，`SEDModel` 与各融合模型都实现了 `make_teacher_copy()`，用于 Mean-Teacher 的教师模型初始化；当编码器处于冻结状态且配置允许时，教师直接共享学生同一份冻结编码器，避免在显存里存两份大模型。
 
 ## 8 训练框架与多分支适配
 
-训练入口是 `train_sed.py`，训练器是 `local/sed_trainer.py` 中的 `SEDTask4`，沿用上游 DCASE baseline 的 Mean-Teacher 半监督框架。教师模型是学生参数的指数移动平均（`ema_factor=0.999`），每个优化步后更新；学生模型同时接收两类信号：有标签数据的监督损失（强标签帧级 BCE、弱标签片段级 BCE）与无标签数据上的一致性损失（默认 MSE，由 `training.self_sup_loss` 选择），一致性损失的权重是 `const_max` 乘以学习率调度器的缩放因子，随训练进程逐步上升。
+训练入口为 `train_sed.py`，训练器为 `local/sed_trainer.py` 中的 `SEDTask4`。Mean-Teacher 教师参数按 EMA 更新。监督损失按强、弱标签掩码计算；一致性损失对整批学生与教师预测计算，在 `synth_only` 下覆盖合成强标签样本。损失形式由 `training.self_sup_loss` 选择，权重为 `const_max` 乘以调度器缩放因子。
 
-为多分支结构做的改动主要有五处。第一，`build_sed_model()` 统一了模型构造，训练器不再直接实例化 CRNN，而是接收一个满足统一接口的模型对象。第二，优化器按模块分组：`opt.param_groups.enable` 打开时，编码器、融合模块与解码器可以各自使用不同的学习率（例如 BEATs `lr_beats`、WavLM `lr_wavlm`、融合 `lr_fusion`、解码器 `lr_decoder`），且只收集 `requires_grad=True` 的参数，冻结分支不会进入优化器。第三，mixup 从特征空间移到了 waveform 空间：保证不同编码器看到的是同一份增强音频，否则不同分支看到的"同一批样本"其实并不同。第四，teacher 模型支持共享冻结编码器（`model.teacher.share_frozen_*`），在冻结 BEATs / WavLM 时显著降低显存占用。第五，模型在前向时可以返回中间特征字典，训练器与评估脚本据此记录分支利用率、门控统计等信息。
+多分支训练框架包含五项功能。第一，`build_sed_model()` 根据统一接口构造模型，训练器接收构造完成的模型对象。第二，`opt.param_groups.enable` 打开时，编码器、融合模块与解码器可以分别使用学习率，例如 BEATs 使用 `lr_beats`、WavLM 使用 `lr_wavlm`、融合模块使用 `lr_fusion`、解码器使用 `lr_decoder`。优化器仅收集 `requires_grad=True` 的参数。第三，mixup 在 waveform 空间执行，使不同编码器接收同一份增强音频。第四，teacher 模型支持共享冻结编码器（`model.teacher.share_frozen_*`），从而降低 BEATs 和 WavLM 冻结时的显存占用。第五，模型前向可以返回中间特征字典，训练器与评估脚本使用该字典统计分支利用率和门控值。
 
-权重加载有三条路径：`--init_from_checkpoint` 只加载权重、不恢复优化器状态（用于 warm start）；`--resume_from_checkpoint` 恢复完整训练状态；`--test_from_checkpoint` / `--eval_from_checkpoint` 只做评估。配置里的 `warmstart` 段（`model.branches.*.warmstart` 与 `model.decoder_warmstart`）会在构建模型时把指定权重加载进对应子模块，支持前缀匹配与 shape 校验，加载不上的键会被打印出来而不是静默忽略。
+权重加载有三条路径：`--init_from_checkpoint` 加载模型参数并创建新的优化器状态；`--resume_from_checkpoint` 恢复完整训练状态；`--test_from_checkpoint` 和 `--eval_from_checkpoint` 进入评估流程。配置里的 `warmstart` 段（`model.branches.*.warmstart` 与 `model.decoder_warmstart`）会在构建模型时把指定权重加载进对应子模块，支持前缀匹配与 shape 校验。加载失败的键会输出到日志。
 
 ## 9 配置轴对照表
 
@@ -133,7 +125,7 @@ late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接
 
 | 配置键 | 取值 | 作用 |
 |---|---|---|
-| `profile` | `rtx_5090` / `hierarchical_ssl_stage_a` | 选择参数覆盖组；前者是单卡 5090 的论文实验配置（残差门控三分支），后者把融合切到层级 SSL 路由 |
+| `profile` | `rtx_5090` / `hierarchical_ssl_stage_a` | 选择参数覆盖组；前者提供单卡训练参数覆盖（残差门控三分支），后者把融合切到层级 SSL 路由 |
 | `model.branches.crnn.enabled` | true / false | 是否启用 CRNN 分支 |
 | `model.branches.beats.enabled` | true / false | 是否启用 BEATs 分支 |
 | `model.branches.wavlm.enabled` | true / false | 是否启用 WavLM 分支 |
@@ -161,17 +153,11 @@ late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接
 | `training.self_sup_loss` | `mse` / `bce` | 一致性损失形式 |
 | `opt.param_groups.enable` | true / false | 是否启用分组学习率 |
 
-## 10 与论文的差异、以及已知限制
+## 10 实现范围
 
-**论文的三种三分支融合方式与代码不是一一对应的类。** 代码提供的是 late、residual_gated、hierarchical_ssl 三条路由以及路由内的配置项；论文表 6 中"特征拼接""固定式中层融合""残差门控融合"三行的具体配置组合记录在当时的实验服务器上（`exp/` 目录未随仓库发布）。阅读代码时应当以本文的路由描述为准，论文表格的数值见 [results.md](results.md)。
+代码提供 `late`、`residual_gated` 和 `hierarchical_ssl` 三条融合路由。训练器支持合成强标签、真实强标签、弱标签和无标签数据。实验结果使用 `synth_only` 配置，对应合成强标签训练集与合成验证集。
 
-**半监督数据管线保留，但当前配置是 `synth_only`。** 训练器仍然支持弱标签、无标签与真实强标签数据，`--strong_real` 与 `training.synth_only` 可以切换；论文实验使用的是合成强标签训练集与合成验证集。
-
-**层级 SSL 融合是论文之后的扩展。** 它带单元测试、能跑通，但没有进入论文的对比表，因此 README 与结果文档都不引用它的数字。
-
-**部分历史命名保留。** 例如 `fusion_type: beats_main_residual_gated` 与模块类名 `BeatsMainResidualGatedFusion` 保留了论文阶段的叫法，配置键与代码类名之间不是完全一一对应；修改时以 `resolve_model_config()` 的映射逻辑为准。
-
-**训练流程未在干净环境端到端验证。** 代码逻辑、配置与文档是一致的，但依赖版本组合、数据目录与权重文件需要使用者自行准备，详见 [reproduction.md](reproduction.md)。
+配置键 `fusion_type: beats_main_residual_gated` 对应 `BEATsMainResidualGatedFusion`。完整映射由 `resolve_model_config()` 处理。训练依赖、数据目录和权重文件的准备方式见 [reproduction.md](reproduction.md)。
 
 ## 11 代码索引
 
