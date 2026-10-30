@@ -1,18 +1,13 @@
 # 异构自监督模型互补融合的声音事件检测
 
-**Heterogeneous Self-Supervised Representation Fusion for Sound Event Detection** · DCASE 2022 Task 4 / DESED
+**Heterogeneous Self-Supervised Representation Fusion for Sound Event Detection**  
+DCASE 2022 Task 4 · DESED · PyTorch · MIT
 
-[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.7-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+这是我本科毕业设计《异构自监督模型互补融合的声音事件检测研究》的代码。DCASE 2022 Task 4 的官方 baseline 把 Mel 前端、CNN、BiGRU 和两个预测头全部写死在一个 CRNN 类里，想换前端就得连训练流程一起改。我把它拆成「编码器 → 时间对齐 → 共享解码器」三层，接进 CRNN、BEATs、WavLM 三个编码器，再实现特征拼接、固定式中层融合和残差门控三种融合方式，让三种异构表征能在同一份数据、同一个标签栅格、同一套训练和评估流程下直接比较，回答"通用音频表征和语音域表征在声音事件检测里到底能不能互补"。
 
-本仓库是本科毕业设计《异构自监督模型互补融合的声音事件检测研究》的完整实现。它把 DCASE 2022 Task 4 官方开源的**单体 CRNN baseline**重构成「编码器 → 时间对齐 → 共享解码器」的可插拔框架，让 CRNN、BEATs、WavLM 三类异构表征可以在同一任务、同一数据、同一标签栅格、同一训练与评估流程下被公平比较；在此基础上实现了特征拼接、固定式中层融合与残差门控三种融合方式，并得到了一组"互补性存在、但不全局稳定"的结论。
+结论先说：CRNN+BEATs 是这套设定下最稳的参考，PSDS1 从 0.356 提到 0.522（+46.6%），Event-F1 从 43.42% 提到 58.64%（+15.22 个百分点）。加入 WavLM 之后，三分支的 Inter-F1 最高到 78.97%（比双分支高 4.61 个点），但 PSDS 和 Event-F1 都没能超过双分支。这个负结果本身是有信息量的：WavLM 补的是时间区间覆盖，不是完整事件检出，而且收益按类别给，BLE、ES 涨，CAT、DOG、SPE 跌。
 
-仓库面向两类读者：想快速了解结论的人只需要看下面的结果表与两段结论；想深挖实现的人可以从 [`docs/architecture.md`](docs/architecture.md) 进入系统设计，从 [`docs/results.md`](docs/results.md) 查看完整实验数据，从 [`docs/reproduction.md`](docs/reproduction.md) 了解环境与数据准备。
-
-## 主要结果
-
-下表是 DESED 合成验证集上的整体结果，指标为 PSDS1、PSDS2、Event-F1 与 Inter-F1，全部取自论文第 4 章的表 4 与表 6。
+## 结果
 
 | 模型 | PSDS1 | PSDS2 | Event-F1 (%) | Inter-F1 (%) |
 |---|---|---|---|---|
@@ -25,95 +20,62 @@
 | CRNN+BEATs+WavLM（固定式中层融合） | 0.492 | 0.734 | 55.82 | 77.41 |
 | CRNN+BEATs+WavLM（残差门控） | 0.497 | 0.745 | 57.00 | 78.97 |
 
-口径：DESED synthetic train 训练、synthetic validation 评估，强标签（`synth_only`）设定，单卡 RTX 5090（32GB），随机种子固定为 42，每种结构只训练一次。完整的类别级结果、负结果分析、典型样本时间轴与数据说明见 [`docs/results.md`](docs/results.md)。
+口径：DESED synthetic train 训练、synthetic validation 评估，强标签（`synth_only`）设定，单卡 RTX 5090，随机种子固定为 42，每种结构只训练一次。逐类结果、负结果分析和数据口径见 [docs/results.md](docs/results.md)。
 
-![六种模型在四项整体指标上的对比（按存档预测结果重绘，具体数值以表为准）](docs/figures/overall-metrics.png)
+![六种模型在四项整体指标上的对比](docs/figures/overall-metrics.png)
 
-一句话结论：**CRNN 与 BEATs 之间存在明确的互补性**，双分支把 PSDS1 从 0.356 提到 0.522、Event-F1 从 43.42% 提到 58.64%；**再引入 WavLM 后整体指标没有稳定超过双分支**，但三分支的 Inter-F1 提高了 3.05 到 4.61 个百分点——说明语音域表征改善的是时间区间覆盖，而不是完整事件检出，且这种收益是类别条件的。
+## 怎么跑
 
-## 方法
-
-![系统总体架构](docs/figures/architecture.png)
-
-**可插拔的编码器抽象。** 三条分支最终都输出 `[B, T, D]` 的序列特征：CRNN 分支从 log-mel 频谱出发，经 CNN 得到卷积时序特征；BEATs 分支使用 vendored 的最小官方实现，可冻结也可全量微调；WavLM 分支基于 torchaudio bundle，并额外处理了官方 checkpoint 与 torchaudio 接口之间的前缀与 padding mask 差异。换前端只需要改配置里的 `model.branches`，训练与评估流程完全复用。
-
-**显式的时间对齐。** 三路特征的时间分辨率天然不同——CRNN 来自卷积下采样，BEATs 来自 patch embedding 加 Transformer，WavLM 直接吃波形——如果不做对齐，resize 逻辑就会散落在 trainer 和 loss 里，既难以保证比较公平，也无法分析中间特征。因此框架把对齐收敛成两个显式模块：`TimeAligner` 负责把编码器序列对齐到标签栅格（支持 interpolate / nearest / adaptive_avg / adaptive_max 四种策略），`FusionTimeAligner` 负责在融合前把 SSL 序列对齐到 CNN 的时间栅格。
-
-**融合与残差门控。** 特征拼接把三路输出沿特征维并置后交给 Merge MLP；固定式中层融合在进入后端时序模型前做一次结构化整合；残差门控则以较强的 BEATs 表示为主路径、以 CRNN 表示作为门控残差修正：
-
-$$
-\text{fused} = \text{beats\_norm} + \alpha \cdot \text{gate} \cdot \text{cnn\_norm}
-$$
-
-其中两路特征先各自经过线性投影与分支 LayerNorm 拉到同一尺度，门控网络以两路归一化特征的拼接为输入，输出通道级或帧级的门控权重；门控偏置初始化为 −1.5，使模型在训练初期贴近强基线，只有训练证明有效时才放大残差；当 `use_alpha_scale` 打开时 α 本身也是可学习参数。融合后的特征经 Merge MLP 送入共享解码器：可选的 BiGRU 做时序建模，帧级 head 给出 strong 预测，注意力池化 head 给出 weak 预测，再接均值教师半监督训练。
-
-## 快速开始
+先把权重准备好。BEATs 官方权重 `BEATs_iter3+_AS2M.pt` 和本项目微调出来的 `BEATs_full_finetune_best_0_78.pt` 都放到 `pretrained/beats/` 下，后者 345 MB，在 [Releases 的 beats-fullft-v1](https://github.com/HarryWeasley3/dcase-2022-task4/releases/tag/beats-fullft-v1) 里，sha256 是 `dff86d366a70079d7e94d2da787d9d216a4cf2a418d666a25fc79c2172432fec`，`BEATsEncoder` 可以直接加载。
 
 ```bash
-# 1) 环境：Python 3.10 + PyTorch 2.7（cu128 运行时，论文环境见 docs/reproduction.md）
-pip install -r requirements.txt
+pip install -r requirements.txt   # Python 3.10 + PyTorch 2.7 (cu128)
 
-# 2) 数据：准备 DESED 合成训练集与验证集，并把 confs/experiment_unified.yaml
-#    里的 data.* 路径指向本地目录（键名与官方目录结构一致）
-
-# 3) 权重：把 BEATs、WavLM 与 CRNN warm-start 权重放到 pretrained/ 下，
-#    具体文件名与获取方式见 docs/reproduction.md
-
-# 4) 训练（默认 profile 为层级 SSL 融合路由；切到 server_a800 profile 即残差门控三分支）
+# 训练：默认 profile 是 rtx_5090，单卡 5090 就能跑，跑的是论文那套三分支残差门控
 python train_sed.py --conf_file confs/experiment_unified.yaml --gpus 1
 
-# 5) 评估
+# 评估
 python train_sed.py --conf_file confs/experiment_unified.yaml --gpus 1 \
-    --test_from_checkpoint ./exp/<run_name>/version_0/<best>.ckpt
+    --test_from_checkpoint ./exp/<run>/version_0/<best>.ckpt
 ```
 
-需要说明的是，仓库不包含训练权重和 `exp/` 结果目录，完整复现需要自行准备 BEATs 与 WavLM 的官方权重以及一份 CRNN warm-start checkpoint；上面这几条命令也没有在全新环境中做过端到端验证，细节和常见问题见 [`docs/reproduction.md`](docs/reproduction.md)。
+想复现双分支那组，把 `model.branches.wavlm.enabled` 改成 `false` 就行，融合路由会自动切到 CRNN+BEATs 那条。数据按 `confs/experiment_unified.yaml` 里 `data.*` 的键准备 DESED 合成训练集与验证集；WavLM 权重、数据目录映射、显存不够时怎么冻结分支、几个常见报错，都写在 [docs/reproduction.md](docs/reproduction.md)。
 
-## 仓库结构
+## 实现
 
-| 路径 | 说明 | 来源 |
-|---|---|---|
-| `sed_modeling/` | 编码器、时间对齐、融合模块、共享解码器与模型装配（`build_sed_model`） | 本人实现 |
-| `confs/` | `experiment_unified.yaml` 统一配置（含 profile 机制）与上游 baseline 配置 | 本人 / 上游 |
-| `train_sed.py` | 统一训练、断点续训与评估入口（Mean-Teacher） | 在上游基础上改写 |
-| `local/` | Mean-Teacher 训练器、数据工具与重采样 | 上游，改动较大 |
-| `desed_task/` | DESED 数据管线、评估指标、学习率调度器与基线 CRNN | 上游 DCASE baseline |
-| `scripts/` | 权重提取与后处理阈值搜索等工具 | 本人实现 |
-| `tests/` | 层级融合与学习率调度的单元测试 | 本人实现 |
-| `docs/` | 架构说明、实验数据、复现指南、设计记录与插图 | 本人实现 |
+### 编码器
 
-`sed_modeling/third_party/beats/` 是 Microsoft BEATs 官方实现的最小 vendored 子集（MIT 许可，见该目录下的 `LICENSE`），只保留特征提取所需部分，以避免引入 fairseq / hydra 等重依赖。
+三个编码器对外是同一个契约：`forward(audio)` 返回 `[B, T, D]` 的 `sequence_features`，`output_dim` 在构造时确定。CRNN 分支是 log-mel 加七层 CNN，保留了上游的频谱裁剪和实例归一化；BEATs 分支用 vendored 的最小官方实现，只留特征提取需要的部分，不引入 fairseq 和 hydra，可以冻结也可以全量微调；WavLM 分支基于 torchaudio bundle，额外处理了官方 checkpoint 和 torchaudio 模型之间的前缀差异，以及 padding mask 到 `lengths` 的转换。换前端只需要改 `model.branches`，训练和评估流程完全不动。
 
-## 结论与局限
+### 时间对齐
 
-本文最重要的发现是一个**有分寸的负结果**：三分支融合在 PSDS、Event-F1 上没有超过强参考双分支，但 Inter-F1 提升显著，且类别层面的涨跌高度不一致（BLE、ES 提升，CAT、DOG、SPE 退化）。把这三件事放在一起，能够说明 WavLM 提供的语音域信息在时间覆盖和部分类别上确实有补充作用，但它无法稳定转化为完整事件级收益；多分支融合的关键不在于增加特征来源，而在于设计能筛掉冗余的融合机制。三种融合方式中残差门控表现相对最好，也印证了这一点。
+三路特征的时间步完全对不上：CRNN 是卷积下采样，BEATs 是 patch embedding 加 Transformer，WavLM 直接吃波形；而损失、后处理和 PSDS 全都工作在固定的标签栅格上。如果不显式对齐，resize 逻辑就会散落在 trainer 和 loss 里，既保证不了比较公平，也没法分析中间特征。所以对齐被收敛成两个模块：`TimeAligner` 把编码器序列对齐到标签栅格，支持 interpolate、nearest、adaptive_avg、adaptive_max 四种策略；`FusionTimeAligner` 在融合前把 SSL 序列对齐到 CNN 的时间栅格。
 
-局限同样需要讲清楚：实验只用了单随机种子、单次训练，没有多种子重复与置信区间；评估只在 DESED 合成验证集上完成，没有向 DCASE 官方测试集提交，跨域泛化尚未验证；消融并不完整，时间对齐策略、Merge MLP、门控超参数与后处理阈值的独立影响还没有逐项拆分；Event-F1 与 Segment-F1 之间的系统性差距说明边界与碎片化仍是主要误差来源，但尚未定量归因。
+### 融合与残差门控
 
-## 引用
+特征拼接把三路输出沿特征维并置后交给 Merge MLP；固定式中层融合在进入后端时序模型前先做一次结构化整合；残差门控则指定 BEATs 为主路径、让新增的 WavLM 或 CRNN 表示以门控残差的形式接进来，公式是 `fused = beats_norm + α · gate · cnn_norm`。两路特征先各自过线性投影和分支 LayerNorm 拉到同一尺度，门控网络以两路归一化特征的拼接为输入，输出通道级或帧级权重。门控最后一层偏置初始化成 -1.5，训练初期 gate 大约是 0.18，模型基本等价于强分支本身，只有训练证明修正有效时门控才会打开；α 也可以通过 `use_alpha_scale` 变成可学习参数。融合表示再经 Merge MLP 送进共享解码器：BiGRU 做时序建模，帧级头给 strong 预测，注意力池化头给 weak 预测。
 
-如果这个仓库对你的工作有帮助，可以引用本项目的毕业论文：
+整个框架在 `sed_modeling/` 下是 26 个文件、约 4400 行，包含 3 个编码器、2 种对齐器、5 个融合模块、7 条多分支装配路由（外加单编码器直连），外层训练器还是上游的 Mean-Teacher，为多分支改了五处：统一模型构造、按模块分组的学习率、mixup 挪到 waveform 域、教师共享冻结编码器、前向暴露中间特征。`tests/` 下有两个单测（层级融合装配与形状、学习率调度），`python -m pytest tests/` 可以跑。
 
-```bibtex
-@thesis{lixiang2026sed,
-  title  = {异构自监督模型互补融合的声音事件检测研究},
-  author = {李想},
-  school = {安徽大学电子信息工程学院},
-  year   = {2026}
-}
-```
+## 目录
 
-本工作建立在以下开源项目与论文之上：
+| 路径 | 说明 |
+|---|---|
+| `sed_modeling/` | 编码器、时间对齐、融合模块、共享解码器与模型装配（`build_sed_model`） |
+| `confs/` | 统一配置 `experiment_unified.yaml`（含 `rtx_5090` / `hierarchical_ssl_stage_a` 两个 profile） |
+| `train_sed.py` | 训练、断点续训与评估入口 |
+| `local/` | Mean-Teacher 训练器、数据工具与重采样 |
+| `desed_task/` | DESED 数据管线、评估指标、学习率调度器与基线 CRNN |
+| `scripts/` | 权重提取与后处理阈值搜索 |
+| `tests/` | 层级融合与学习率调度的单元测试 |
+| `docs/` | 架构说明、实验数据、复现指南、设计记录与插图 |
 
-- **DESED / DCASE 2022 Task 4 baseline**：数据管线、评估指标与 Mean-Teacher 训练框架的来源，[DCASE-REPO/DESED_task](https://github.com/DCASE-REPO/DESED_task)
-- **BEATs**：Chen et al., *BEATs: Audio Pre-Training with Acoustic Tokenizers*, 2022
-- **WavLM**：Chen et al., *WavLM: Large-Scale Self-Supervised Pre-Training for Full Stack Speech Processing*, IEEE JSTSP, 2022
-- **Mean Teacher**：Tarvainen & Valpola, *Mean teachers are better role models*, NeurIPS, 2017
+`desed_task/` 和 `sed_modeling/third_party/beats/` 是上游代码，前者来自 DCASE baseline，后者是 Microsoft BEATs 的最小 vendored 子集，许可证各自保留在对应目录和根目录 `LICENSE` 里。
 
-## 致谢
+## 说明
 
-本课题在安徽大学电子信息工程学院苗永春老师与科大讯飞股份有限公司企业导师的联合指导下完成，企业导师提供了方向性指导与对各模型能力边界的判断。实现过程中使用了学校与实验室提供的算力支持。
+实验只用了单随机种子、单次训练，百分点级的类别差异别当成显著结论；评估只在 DESED 合成验证集上做，没有提交官方测试集，所以结论只对这个数据设定成立。WavLM 的微调权重和 CRNN warm-start 还没发布，仓库里只有 BEATs 那份；`--eval_from_checkpoint` 那条路有两个已知小问题（teacher 目录里写的是 student 的预测、能耗文件不会生成），细节写在 [docs/reproduction.md](docs/reproduction.md)。多卡没跑过，代码里会直接抛 `NotImplementedError`。
 
 ## License
 
-本项目采用 [MIT License](LICENSE)。`desed_task/` 与 `sed_modeling/third_party/beats/` 中的代码分别来自 DCASE baseline 与 Microsoft BEATs，遵循其各自的上游许可证。
+MIT，见 [LICENSE](LICENSE)。
