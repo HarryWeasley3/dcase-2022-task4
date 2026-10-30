@@ -57,7 +57,7 @@ flowchart LR
 
 时间对齐是这个框架里最容易被低估、但直接决定比较是否公平的模块。
 
-三路编码器的时间步来源完全不同：CRNN 的 `T` 来自卷积下采样（`hop_length=256` 配 `net_subsample=4`，因此大致是每秒 25 帧），BEATs 的 `T` 来自 patch embedding 与 Transformer 的序列长度，WavLM 的 `T` 来自卷积特征提取器与 Transformer 的下采样。而损失函数、后处理与 PSDS 评估都工作在固定的标签帧栅格 `T_label` 上。如果不显式对齐，每一处使用这些特征的地方都要各自写 resize，比较结果就无法归因。
+三路编码器的时间步来源完全不同：CRNN 的 `T` 来自卷积下采样（`hop_length=256` 对应 16 ms 一帧，CNN 在时间维再下采样 4 倍，因此输出约 64 ms 一帧），BEATs 的 `T` 来自 patch embedding 与 Transformer 的序列长度，WavLM 的 `T` 来自卷积特征提取器与 Transformer 的下采样。而损失函数、后处理与 PSDS 评估都工作在固定的标签帧栅格 `T_label` 上。如果不显式对齐，每一处使用这些特征的地方都要各自写 resize，比较结果就无法归因。
 
 `TimeAligner` 因此被做成一个显式模块，输入必须是 `[B, T, D]`，输出 `[B, target_length, D]`，支持四种策略：
 
@@ -79,6 +79,8 @@ late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接
 ![特征拼接结构](figures/fusion-concat.png)
 
 论文中与"特征拼接"并列的"固定式中层融合"在代码里没有独立的模型类，它落在同一条 late 路由上，通过融合位置与 MergeMLP 的配置差异表达；三种三分支融合方式的具体配置组合记录在论文实验日志中，仓库保留的是这条路由的全部可调项（见 [design/fusion-late.md](design/fusion-late.md)）。
+
+![固定式中层融合结构](figures/fusion-mid.png)
 
 ### 5.2 残差门控融合
 
@@ -151,7 +153,8 @@ $$
 | `model.fusion.late.merge_mlp_dim` | 整数，默认 256 | MergeMLP 输出维度 |
 | `model.fusion.residual_gated.fuse_dim` | 整数，默认 256 | 门控融合的投影维度 |
 | `model.fusion.residual_gated.gate_mode` | `channel` / `frame` | 门控粒度 |
-| `model.fusion.residual_gated.gate_bias_init` | 浮点，默认 −1.5 | 门控初始偏置（控制初期残差强度） |
+| `model.fusion.residual_gated.gate_hidden_dim` | 整数或 null | 门控网络隐层维度（null 时等于 `fuse_dim`） |
+| `model.fusion.residual_gated.alpha_init` | 浮点，默认 0.2 | α 的初值（门控偏置 −1.5 是模块默认值，不通过 YAML 配置） |
 | `model.fusion.residual_gated.use_alpha_scale` | true / false | α 是否可学习 |
 | `model.fusion.residual_gated.use_post_fusion_proj` | true / false | 融合后是否再做一次投影 |
 | `model.align.method` | `interpolate` / `nearest` / `adaptive_avg` / `adaptive_max` | 标签栅格对齐策略 |
