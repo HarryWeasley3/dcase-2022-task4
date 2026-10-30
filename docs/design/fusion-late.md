@@ -1,5 +1,7 @@
 # CRNN + BEATs Late Fusion
 
+> **文档状态**：本文记录 2026-03 的设计阶段，保留作为工程决策的历史记录。当前实现见 `sed_modeling/models/crnn_beats_late_fusion.py` 与 [architecture.md](../architecture.md)。
+
 ## 1. 目标
 
 这一版不是 posterior fusion，也不是把两个独立模型的输出在推理时做加权平均。

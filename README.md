@@ -1,437 +1,119 @@
-### DCASE2022 Task 4 Baseline for Sound Event Detection in Domestic Environments.
+# 异构自监督模型互补融合的声音事件检测
 
----
+**Heterogeneous Self-Supervised Representation Fusion for Sound Event Detection** · DCASE 2022 Task 4 / DESED
 
-## Requirements
+[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.7-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-The script `conda_create_environment.sh` is available to create an environment which runs the
-following code (recommended to run line by line in case of problems).
+本仓库是本科毕业设计《异构自监督模型互补融合的声音事件检测研究》的完整实现。它把 DCASE 2022 Task 4 官方开源的**单体 CRNN baseline**重构成「编码器 → 时间对齐 → 共享解码器」的可插拔框架，让 CRNN、BEATs、WavLM 三类异构表征可以在同一任务、同一数据、同一标签栅格、同一训练与评估流程下被公平比较；在此基础上实现了特征拼接、固定式中层融合与残差门控三种融合方式，并得到了一组"互补性存在、但不全局稳定"的结论。
 
-#### Common issues
+仓库面向两类读者：想快速了解结论的人只需要看下面的结果表与两段结论；想深挖实现的人可以从 [`docs/architecture.md`](docs/architecture.md) 进入系统设计，从 [`docs/results.md`](docs/results.md) 查看完整实验数据，从 [`docs/reproduction.md`](docs/reproduction.md) 了解环境与数据准备。
 
-**Data Download**
+## 主要结果
 
-`FileNotFoundError: [Errno 2] No such file or directory: 'ffprobe'`
+下表是 DESED 合成验证集上的整体结果，指标为 PSDS1、PSDS2、Event-F1 与 Inter-F1，全部取自论文第 4 章的表 4 与表 6。
 
-it probably means you have to install ffmpeg on your machine.
+| 模型 | PSDS1 | PSDS2 | Event-F1 (%) | Inter-F1 (%) |
+|---|---|---|---|---|
+| CRNN（baseline） | 0.356 | 0.578 | 43.42 | 71.25 |
+| BEATs（通用音频 SSL） | 0.465 | 0.780 | 52.65 | 65.80 |
+| WavLM（语音域 SSL） | 0.375 | 0.678 | 45.75 | 59.80 |
+| **CRNN + BEATs** | **0.522** | **0.816** | **58.64** | **74.36** |
+| CRNN + WavLM | 0.362 | 0.666 | 46.75 | 62.20 |
+| CRNN+BEATs+WavLM（特征拼接） | 0.486 | 0.750 | 56.25 | 77.53 |
+| CRNN+BEATs+WavLM（固定式中层融合） | 0.492 | 0.734 | 55.82 | 77.41 |
+| CRNN+BEATs+WavLM（残差门控） | 0.497 | 0.745 | 57.00 | 78.97 |
 
-A possible installation: `sudo apt install ffmpeg`
+口径：DESED synthetic train 训练、synthetic validation 评估，强标签（`synth_only`）设定，单卡 RTX 5090（32GB），随机种子固定为 42，每种结构只训练一次。完整的类别级结果、负结果分析、典型样本时间轴与数据说明见 [`docs/results.md`](docs/results.md)。
 
+![六种模型在四项整体指标上的对比（按存档预测结果重绘，具体数值以表为准）](docs/figures/overall-metrics.png)
 
- **Training**
+一句话结论：**CRNN 与 BEATs 之间存在明确的互补性**，双分支把 PSDS1 从 0.356 提到 0.522、Event-F1 从 43.42% 提到 58.64%；**再引入 WavLM 后整体指标没有稳定超过双分支**，但三分支的 Inter-F1 提高了 3.05 到 4.61 个百分点——说明语音域表征改善的是时间区间覆盖，而不是完整事件检出，且这种收益是类别条件的。
 
-If training appears too slow, check with `top` and with `nvidia-smi` that you 
-are effectively using a GPU and not the CPU. 
-If running `python train_sed.py` uses by default the CPU you may have **pytorch** installed 
-without CUDA support. 
+## 方法
 
-Check with IPython by running this pytorch line `torch.rand((1)).cuda()` 
-If you encounter an error install CUDA-enabled pytorch from https://pytorch.org/
-Check again till you can run `torch.rand((1)).cuda()` successfully. 
+![系统总体架构](docs/figures/architecture.png)
 
-## Dataset
-You can download the development dataset using the script: `generate_dcase_task4_2022.py`.
-The development dataset is composed of two parts:
-- real-world data ([DESED dataset][desed]): this part of the dataset is composed of strong labels, weak labels, unlabeled, and validation data which are coming from [Audioset][audioset].
+**可插拔的编码器抽象。** 三条分支最终都输出 `[B, T, D]` 的序列特征：CRNN 分支从 log-mel 频谱出发，经 CNN 得到卷积时序特征；BEATs 分支使用 vendored 的最小官方实现，可冻结也可全量微调；WavLM 分支基于 torchaudio bundle，并额外处理了官方 checkpoint 与 torchaudio 接口之间的前缀与 padding mask 差异。换前端只需要改配置里的 `model.branches`，训练与评估流程完全复用。
 
-- synthetically generated data: this part of the dataset is composed of synthetically soundscapes, generated using [Scaper][scaper]. 
+**显式的时间对齐。** 三路特征的时间分辨率天然不同——CRNN 来自卷积下采样，BEATs 来自 patch embedding 加 Transformer，WavLM 直接吃波形——如果不做对齐，resize 逻辑就会散落在 trainer 和 loss 里，既难以保证比较公平，也无法分析中间特征。因此框架把对齐收敛成两个显式模块：`TimeAligner` 负责把编码器序列对齐到标签栅格（支持 interpolate / nearest / adaptive_avg / adaptive_max 四种策略），`FusionTimeAligner` 负责在融合前把 SSL 序列对齐到 CNN 的时间栅格。
 
-### Usage:
-Run the command `python generate_dcase_task4_2022.py --basedir="../../data"` to download the dataset (the user can change basedir to the desired data folder.)
+**融合与残差门控。** 特征拼接把三路输出沿特征维并置后交给 Merge MLP；固定式中层融合在进入后端时序模型前做一次结构化整合；残差门控则以较强的 BEATs 表示为主路径、以 CRNN 表示作为门控残差修正：
 
-If the user already has downloaded part of the dataset, it does not need to re-download the whole set. It is possible to download only part of the full dataset, if needed, using the options:
+$$
+\text{fused} = \text{beats\_norm} + \alpha \cdot \text{gate} \cdot \text{cnn\_norm}
+$$
 
- - **only_strong** (download only the strong labels of the DESED dataset)
- - **only_real** (download the weak labels, unlabeled and validation data of the DESED dataset)
- - **only_synth** (download only the synthetic part of the dataset)
+其中两路特征先各自经过线性投影与分支 LayerNorm 拉到同一尺度，门控网络以两路归一化特征的拼接为输入，输出通道级或帧级的门控权重；门控偏置初始化为 −1.5，使模型在训练初期贴近强基线，只有训练证明有效时才放大残差；当 `use_alpha_scale` 打开时 α 本身也是可学习参数。融合后的特征经 Merge MLP 送入共享解码器：可选的 BiGRU 做时序建模，帧级 head 给出 strong 预测，注意力池化 head 给出 weak 预测，再接均值教师半监督训练。
 
- For example, if the user already has downloaded the real and synthetic part of the set, it can integrate the dataset with the strong labels of the DESED dataset with the following command:
+## 快速开始
 
- `python generate_dcase_task4_2022.py --only_strong` 
+```bash
+# 1) 环境：Python 3.10 + PyTorch 2.7（cu128 运行时，论文环境见 docs/reproduction.md）
+pip install -r requirements.txt
 
- If the user wants to download only the synthetic part of the dataset, it could be done with the following command: 
+# 2) 数据：准备 DESED 合成训练集与验证集，并把 confs/experiment_unified.yaml
+#    里的 data.* 路径指向本地目录（键名与官方目录结构一致）
 
- `python generate_dcase_task4_2022.py --only_synth`
+# 3) 权重：把 BEATs、WavLM 与 CRNN warm-start 权重放到 pretrained/ 下，
+#    具体文件名与获取方式见 docs/reproduction.md
 
+# 4) 训练（默认 profile 为层级 SSL 融合路由；切到 server_a800 profile 即残差门控三分支）
+python train_sed.py --conf_file confs/experiment_unified.yaml --gpus 1
 
-Once the dataset is downloaded, the user should find the folder **missing_files**, containing the list of files from the real-world dataset (desed_real) which was not possible to download. You need to download it and **send your missing files to the task
-organisers to get the complete dataset** (in priority to Francesca Ronchini and Romain serizel).
-
-
-### Development dataset
-
-The dataset is composed by 4 different splits of training data: 
-- Synthetic training set with strong annotations
-- Strong labeled training set **(only for the SED Audioset baseline)**
-- Weak labeled training set 
-- Unlabeled in domain training set
-
-#### Synthetic training set with strong annotations
-
-This set is composed of **10000** clips generated with the [Scaper][scaper] soundscape synthesis and augmentation library. The clips are generated such that the distribution per event is close to that of the validation set.
-
-The strong annotations are provided in a tab separated csv file under the following format:
-
-`[filename (string)][tab][onset (in seconds) (float)][tab][offset (in seconds) (float)][tab][event_label (string)]`
-
-For example: YOTsn73eqbfc_10.000_20.000.wav 0.163 0.665 Alarm_bell_ringing
-
-#### Strong labeled training set 
-
-This set is composed of **3470** audio clips coming from [Audioset][audioset]. 
-
-**This set is used at training only for the SED Audioset baseline.** 
-
-The strong annotations are provided in a tab separated csv file under the following format:
-
-`[filename (string)][tab][onset (in seconds) (float)][tab][offset (in seconds) (float)][tab][event_label (string)]`
-
-For example: Y07fghylishw_20.000_30.000.wav 0.163 0.665 Dog
-
-
-#### Weak labeled training set 
-
-This set contains **1578** clips (2244 class occurrences) for which weak annotations have been manually verified for a small subset of the training set. 
-
-The weak annotations are provided in a tab separated csv file under the following format:
-
-`[filename (string)][tab][event_labels (strings)]`
-
-For example: Y-BJNMHMZDcU_50.000_60.000.wav Alarm_bell_ringing,Dog
-
-
-#### Unlabeled in domain training set
-
-This set contains **14412** clips. The clips are selected such that the distribution per class (based on Audioset annotations) is close to the distribution in the labeled set. However, given the uncertainty on Audioset labels, this distribution might not be exactly similar.
-
-
-
-The dataset uses [FUSS][fuss_git], [FSD50K][FSD50K], [desed_soundbank][desed] and [desed_real][desed]. 
-
-For more information regarding the dataset, please refer to the [previous year DCASE Challenge website][dcase_21_dataset]. 
-
-
-
-## Training
-We provide **three** baselines for the task:
-- SED baseline
-- baseline using pre-trained embedding extractor DNN. 
-- baseline using Audioset data (real-world strong-label data)
-
-For now, only the SED baseline is available (the missing baseline will be published soon).
-
-### How to run the Baseline systems
-The **SED baseline** can be run from scratch using the following command:
-
-`python train_sed.py`
-
----
-
-**NOTE: Currently multi-GPUs is not supported**
-
-**note**: `python train_sed.py --gpus 0` will use the CPU. GPU indexes start from 1 here.
-
-**Common issues**
-
-If you encounter: 
-`pytorch_lightning.utilities.exceptions.MisconfigurationException: You requested GPUs: [0]
- But your machine only has: [] (edited) `
-
-or 
-
-`OSError: libc10_cuda.so: cannot open shared object file: No such file or directory`
-
-
-It probably means you have installed CPU-only version of Pytorch or have installed the incorrect 
-**cudatoolkit** version. 
-Please install the correct version from https://pytorch.org/
-
----
-
-Note that the default training config will use GPU 0. 
-Alternatively, we provide a [pre-trained checkpoint][zenodo_pretrained_models] along with tensorboard logs. The baseline can be tested on the development set of the dataset using the following command:
-
-`python train_sed.py --test_from_checkpoint /path/to/downloaded.ckpt`
-
-The tensorboard logs can be tested using the command `tensorboard --logdir="path/to/exp_folder"`. 
-
-
-## **(NEW!)** Energy Consumption
-
-In this year DCASE Task 4 Challenge, we also use energy consumption (kWh)
-via [CodeCarbon](https://github.com/mlco2/codecarbon) as an additional metric to rank the submitted systems.
-
-We encourage the participants to provide, for each submitted system (or at least the best one), the following energy consumption figures in kWh using [CodeCarbon](https://github.com/mlco2/codecarbon):
-
-1) whole system training
-2) devtest inference
-3) evaluation set inference
-
-You can refer to [Codecarbon](https://github.com/mlco2/codecarbon) on how to do this (super simple! 😉 )
-or to this baseline code see `local/sed_trained.py` for some hints on 
-how we are doing this for the baseline system.
-
-
-**Important** 
-
-In addition to this, we kindly suggest the participants to
-provide the energy consumption in kWh (using the same hardware used for 2) and 3)) of:
-
-1) devtest inference for baseline system using: 
-
-`python train_sed.py --test_from_checkpoint /path/to/downloaded.ckpt`
-You can find the energy consumed in kWh in `./exp/2022_baseline/devtest_codecarbon/devtest_tot_kwh.txt`
-
-2) evaluation set inference for baseline system using:
-`python train_sed.py --eval_from_checkpoint /path/to/downloaded.ckpt`
-You can find the energy consumed in kWh in `./exp/2022_baseline/evaluation_codecarbon/eval_tot_kwh.txt`
-
-**Why we require this ?**
-
-Energy consumption depends on hardware and each participant uses
-different hardware. 
-
-To obviate for this difference we use the baseline inference kWh energy consumption 
-as a common reference. Because of this, it is important that the
-inference energy consumption figures for both submitted system 
-and baseline are computed on same hardware under similar loading. 
-
-
-#### Results:
-
-Dataset | **PSDS-scenario1** | **PSDS-scenario2** | *Intersection-based F1* | *Collar-based F1* 
---------|--------------------|--------------------|-------------------------|-----------------
-Dev-test| **0.336**          | **0.536**          | 64.1%                   | 40.1%
-
-**Energy Consumption** (GPU: NVIDIA A100 40Gb)
-
-Dataset | Training  | Dev-Test |
---------|-----------|--------------------
-**kWh** | **1.717** | **0.030**           
-
-
-
-Collar-based = event-based. More information about the metrics in the DCASE Challenge [webpage][dcase22_webpage].
-
-The results are from the **student** predictions. 
-
-**NOTES**:
-
-All baselines scripts assume that your data is in `../../data` folder in DESED_task directory.
-If your data is in another folder, you will have to change the paths of your data in the corresponding `data` keys in YAML configuration file in `conf/sed.yaml`.
-Note that `train_sed.py` will create (at its very first run) additional folders with resampled data (from 44kHz to 16kHz)
-so the user need to have write permissions on the folder where your data are saved.
-
-**Hyperparameters** can be changed in the YAML file (e.g. lower or higher batch size).
-
-A different configuration YAML (for example sed_2.yaml) can be used in each run using `--conf_file="confs/sed_2.yaml` argument.
-
-The default directory for checkpoints and logging can be changed using `--log_dir="./exp/2021_baseline`.
-
-Training can be resumed using the following command:
-
-`python train_sed.py --resume_from_checkpoint /path/to/file.ckpt`
-
-In order to make a "fast" run, which could be useful for development and debugging, you can use the following command: 
-
-`python train_sed.py --fast_dev_run`
-
-It uses very few batches and epochs so it won't give any meaningful result.
-
-**Architecture**
-
-The baseline is the same as the [DCASE 2021 Task 4 baseline][dcase_21_repo], based on a Mean-Teacher model [1].
-
-
-The baseline uses a Mean-Teacher model which is a combination of two models: a student model and a
-teacher model, having the same architecture. The student model is the one used at inference while the goal of the teacher is to help the student model during training. The teacher's weight are the exponential average of the student model's weights. The models are a combination of a convolutional neural network (CNN) and a recurrent neural network (RNN) followed by an attention layer. The output of the RNN gives strong predictions while the output of the attention layer gives the weak predictions [2]. 
-
-Figure 1 shows an illustration of the baseline model. 
-
-| ![This is an image](./img/mean_teacher.png) |
-|:--:|
-| *Figure 1: baseline Mean-teacher model. Adapted from [2].* |
-
-Mixup is used as data augmentation technique for weak and synthetic data by mixing data in a batch (50% chance of applying it) [3].
-
-For more information regarding the baseline model, the reader is referred to [1] and [2].
-
-
-### SED baseline using Audioset data (real-world strong-label data)
-The SED baseline using the strongly annotated part of Audioset can be run from scratch using the following command:
-
-`python train_sed.py --strong_real`
-
-The command will automatically considered the strong labels recorded data coming from Audioset in the training process.
-
-Alternatively, also in this case, we provide a [pre-trained checkpoint][zenodo_pretrained_audioset_models]. The baseline can be tested on the development set of the dataset using the following command:
-
-`python train_sed.py --test_from_checkpoint /path/to/downloaded.ckpt`
-
-#### Results:
-
-Dataset | **PSDS-scenario1** | **PSDS-scenario2** | *Intersection-based F1* | *Collar-based F1*
---------|--------------------|--------------------|-------------------------|-----------------
-Dev-test| **0.351**          | **0.552**          | 64.3%                   | 42.9%
-
-
-**Energy Consumption** (GPU: NVIDIA A100 40Gb)
-
-Dataset | Training  | Dev-Test |
---------|-----------|--------------------
-**kWh** | **2.418** | **0.027**           
-
-Collar-based = event-based. More information about the metrics in the DCASE Challenge [webpage][dcase22_webpage].
-
-The results are computed from the **student** predictions. 
-
-All the comments related to the possibility of resuming the training and the fast development run in the [SED baseline][sed_baseline] are valid also in this case.
-
-## **(NEW)** baseline using pre-trained embeddings from models (SEC/Tagging) trained on Audioset
-We added a new baseline which exploits pre-trained models such as [PANNs](https://arxiv.org/abs/1912.10211) and [AST](https://arxiv.org/abs/2104.01778) to increase the performance.
-to increase the performance.
-
-In this baseline the frame-level or whole-clip level features are used in a late-fusion fashion 
-with the existing CRNN baseline classifier.
-See `desed_task/nnet/CRNN.py` for details. The whole-clip features are concatenated with CNN extracted features in the baseline
-CRNN classifier. 
-
-Regarding he frame-level features, since they have different sequence length w.r.t. CNN features 
-we use a trainable RNN-based encoder to encode those to a fixed dim output (obtaining again a whole-clip level embedding).
-This embedding is then concatenated in the same way as the whole-clip features.
-
-**We provide different ways to integrate such pre-trained models.**
-
-See the configuration file: `./confs/pretrained.yaml`:
-```yaml
-pretrained:
-  model: ast
-  e2e: False
-  freezed: True
-  url: https://zenodo.org/record/3987831/files/Cnn14_16k_mAP%3D0.438.pth?download=1
-  dest: ./pretrained_models/Cnn14_16k_mAP%3D0.438.pth
-  extracted_embeddings_dir: ./embeddings
- ```
-
-
-You can choose **ast** or **panns**. 
-You can choose whether to keep the pre-trained model **freezed** or train it along with the CRNN architecture. 
-If you want to keep it freezed, we already provide the pre-extracted embeddings for you. 
-This is useful if you want to train with a big batch size because you won't have to store the rather heavy 
-PANNs or AST models on your GPU. 
-
-Here are the links to the pre-extracted embeddings for AST and PANNs: 
-
-
-https://zenodo.org/record/6541454#.YnzHq2YzbDI (unalabeled ast)
-
-https://zenodo.org/record/6539466#.YnvtWmYzbAM (ast synth train, ast synth val,ast weak val)
-
-https://zenodo.org/record/6518380#.YnvWZGYzbAM (panns, ast weak train, ast devtest)
-
-You can download and unpack them in your preferred directory. 
-Do not forget then to set in the configuration
-above `extracted_embeddings_dir: YOUR_PATH`. 
-The script expects a folder structure like this:
-
-```
-YOUR_PATH |--- ast
-                  |----  devtest.hdf5    
-                  |----  synth_train.hdf5
-                  |----  unlabeled_train.hdf5
-                  |----  weak_train.hdf5
-                  |----  weak_val.hdf5
-                  |----  synth_val.hdf5   
-          |--- panns
-                  |----  devtest.hdf5    
-                  |----  synth_train.hdf5
-                  |----  unlabeled_train.hdf5
-                  |----  weak_train.hdf5
-                  |----  weak_val.hdf5
-                  |----  synth_val.hdf5 
+# 5) 评估
+python train_sed.py --conf_file confs/experiment_unified.yaml --gpus 1 \
+    --test_from_checkpoint ./exp/<run_name>/version_0/<best>.ckpt
 ```
 
-You can also select if you want to do late fusion with global, whole-clip features from PANNs or 
-frame-level features in `./confs/pretrained.yaml`:
-```yaml
-  nb_filters: [ 16, 32, 64, 128, 128, 128, 128 ]
-  pooling: [ [ 2, 2 ], [ 2, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ] ]
-  dropout_recurrent: 0
-  use_embeddings: True
-  embedding_size: 768 # use 2048 for PANNs global and frame, 527 for AST global and 768 for AST frame
-  embedding_type: frame # or global
- ```
+需要说明的是，仓库不包含训练权重和 `exp/` 结果目录，完整复现需要自行准备 BEATs 与 WavLM 的官方权重以及一份 CRNN warm-start checkpoint；上面这几条命令也没有在全新环境中做过端到端验证，细节和常见问题见 [`docs/reproduction.md`](docs/reproduction.md)。
 
-**The training can be started simply with**
+## 仓库结构
 
-`python train_pretrained.py`
-By default this uses AST with frame-level embeddings. The pre-trained model is freezed and expects the pre-extracted AST 
-embeddings in a local folder `./embeddings` as you can see from the details provided before about the YAML config. 
-Thus you would need to download the AST embeddings from the Zenodo links above, unless you set `freezed: False`. 
-However, the latter requires significant GPU memory.
+| 路径 | 说明 | 来源 |
+|---|---|---|
+| `sed_modeling/` | 编码器、时间对齐、融合模块、共享解码器与模型装配（`build_sed_model`） | 本人实现 |
+| `confs/` | `experiment_unified.yaml` 统一配置（含 profile 机制）与上游 baseline 配置 | 本人 / 上游 |
+| `train_sed.py` | 统一训练、断点续训与评估入口（Mean-Teacher） | 在上游基础上改写 |
+| `local/` | Mean-Teacher 训练器、数据工具与重采样 | 上游，改动较大 |
+| `desed_task/` | DESED 数据管线、评估指标、学习率调度器与基线 CRNN | 上游 DCASE baseline |
+| `scripts/` | 权重提取与后处理阈值搜索等工具 | 本人实现 |
+| `tests/` | 层级融合与学习率调度的单元测试 | 本人实现 |
+| `docs/` | 架构说明、实验数据、复现指南、设计记录与插图 | 本人实现 |
 
-Also in this case, we provide a [pre-trained checkpoint][zenodo_pretrained_audioset_models]. The baseline can be tested on the development set of the dataset using the following command:
+`sed_modeling/third_party/beats/` 是 Microsoft BEATs 官方实现的最小 vendored 子集（MIT 许可，见该目录下的 `LICENSE`），只保留特征提取所需部分，以避免引入 fairseq / hydra 等重依赖。
 
-`python train_pretrained.py --test_from_checkpoint /path/to/downloaded.ckpt`
+## 结论与局限
 
-#### Results for best system, late fusion with AST frame:
+本文最重要的发现是一个**有分寸的负结果**：三分支融合在 PSDS、Event-F1 上没有超过强参考双分支，但 Inter-F1 提升显著，且类别层面的涨跌高度不一致（BLE、ES 提升，CAT、DOG、SPE 退化）。把这三件事放在一起，能够说明 WavLM 提供的语音域信息在时间覆盖和部分类别上确实有补充作用，但它无法稳定转化为完整事件级收益；多分支融合的关键不在于增加特征来源，而在于设计能筛掉冗余的融合机制。三种融合方式中残差门控表现相对最好，也印证了这一点。
 
+局限同样需要讲清楚：实验只用了单随机种子、单次训练，没有多种子重复与置信区间；评估只在 DESED 合成验证集上完成，没有向 DCASE 官方测试集提交，跨域泛化尚未验证；消融并不完整，时间对齐策略、Merge MLP、门控超参数与后处理阈值的独立影响还没有逐项拆分；Event-F1 与 Segment-F1 之间的系统性差距说明边界与碎片化仍是主要误差来源，但尚未定量归因。
 
-Dataset | **PSDS-scenario1** | **PSDS-scenario2** | *Intersection-based F1* | *Collar-based F1*
---------|------------|--------------------|-------------------------|-----------------
-Dev-test| **32.24%**          |    **72.22%**       | **90.34**               |  **37.16**
+## 引用
 
+如果这个仓库对你的工作有帮助，可以引用本项目的毕业论文：
 
-**Energy Consumption** (GPU: NVIDIA A100 40Gb)
-**Note we used pre-extracted embeddings, so the power consuption for the pre-trained model is not accounted for**
+```bibtex
+@thesis{lixiang2026sed,
+  title  = {异构自监督模型互补融合的声音事件检测研究},
+  author = {李想},
+  school = {安徽大学电子信息工程学院},
+  year   = {2026}
+}
+```
 
-Dataset | Training | Dev-Test |
---------|----------|--------------------
-**kWh** | **4.41** | **0.036**           
+本工作建立在以下开源项目与论文之上：
 
-Collar-based = event-based. More information about the metrics in the DCASE Challenge [webpage][dcase22_webpage].
+- **DESED / DCASE 2022 Task 4 baseline**：数据管线、评估指标与 Mean-Teacher 训练框架的来源，[DCASE-REPO/DESED_task](https://github.com/DCASE-REPO/DESED_task)
+- **BEATs**：Chen et al., *BEATs: Audio Pre-Training with Acoustic Tokenizers*, 2022
+- **WavLM**：Chen et al., *WavLM: Large-Scale Self-Supervised Pre-Training for Full Stack Speech Processing*, IEEE JSTSP, 2022
+- **Mean Teacher**：Tarvainen & Valpola, *Mean teachers are better role models*, NeurIPS, 2017
 
-The results are computed from the **teacher** predictions. 
+## 致谢
 
-All the comments related to the possibility of resuming the training and the fast development run in the [SED baseline][sed_baseline] are valid also in this case.
+本课题在安徽大学电子信息工程学院苗永春老师与科大讯飞股份有限公司企业导师的联合指导下完成，企业导师提供了方向性指导与对各模型能力边界的判断。实现过程中使用了学校与实验室提供的算力支持。
 
+## License
 
-
-
-**Architecture**
-
-The architecture of the SED Audioset baseline is the same as the [SED baseline][sed_baseline]. 
-
-
-[audioset]: https://research.google.com/audioset/
-[dcase22_webpage]: https://dcase.community/challenge2022/task-sound-event-detection-in-domestic-environments
-[dcase_21_repo]: https://github.com/DCASE-REPO/DESED_task/tree/master/recipes/dcase2021_task4_baseline
-[dcase_21_dataset]: https://dcase.community/challenge2021/task-sound-event-detection-and-separation-in-domestic-environments#audio-dataset
-[desed]: https://github.com/turpaultn/DESED
-[fuss_git]: https://github.com/google-research/sound-separation/tree/master/datasets/fuss
-[fsd50k]: https://zenodo.org/record/4060432
-[zenodo_pretrained_models]: https://zenodo.org/record/4639817
-[zenodo_pretrained_audioset_models]: https://zenodo.org/record/6447197
-[zenodo_pretrained_ast_embedding_model]: 
-[google_sourcesep_repo]: https://github.com/google-research/sound-separation/tree/master/datasets/yfcc100m
-[sdk_installation_instructions]: https://cloud.google.com/sdk/docs/install
-[zenodo_evaluation_dataset]: https://zenodo.org/record/4892545#.YMHH_DYzadY
-[scaper]: https://github.com/justinsalamon/scaper
-[sed_baseline]: https://github.com/DCASE-REPO/DESED_task/tree/master/recipes/dcase2022_task4_baseline#sed-baseline
-#### References
-[1] L. Delphin-Poulat & C. Plapous, technical report, dcase 2019.
-
-[2] Turpault, Nicolas, et al. "Sound event detection in domestic environments with weakly labeled data and soundscape synthesis."
-
-[3] Zhang, Hongyi, et al. "mixup: Beyond empirical risk minimization." arXiv preprint arXiv:1710.09412 (2017).
-
-[4] Thomee, Bart, et al. "YFCC100M: The new data in multimedia research." Communications of the ACM 59.2 (2016)
-
-[5] Wisdom, Scott, et al. "Unsupervised sound separation using mixtures of mixtures." arXiv preprint arXiv:2006.12701 (2020).
-
-[6] Turpault, Nicolas, et al. "Improving sound event detection in domestic environments using sound separation." arXiv preprint arXiv:2007.03932 (2020).
-
-[7] Ronchini, Francesca, et al. "The impact of non-target events in synthetic soundscapes for sound event detection." arXiv preprint arXiv:2109.14061 (DCASE2021)
-
-[8] Ronchini, Francesca, et al. "A benchmark of state-of-the-art sound event detection systems evaluated on synthetic soundscapes." arXiv preprint arXiv:2202.01487 
-
+本项目采用 [MIT License](LICENSE)。`desed_task/` 与 `sed_modeling/third_party/beats/` 中的代码分别来自 DCASE baseline 与 Microsoft BEATs，遵循其各自的上游许可证。

@@ -1,0 +1,13 @@
+# 统一换行符：仓库以 Linux 环境为主，文本文件一律 LF
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.npz binary

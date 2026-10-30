@@ -1,5 +1,7 @@
 # Encoder-Decoder Refactor for Traditional SED
 
+> **文档状态**：本文记录 2026-03 重构阶段的设计思路，保留作为工程决策的历史记录。当前实现已演进（增加了残差门控、三路融合、层级 SSL 融合等路由），以 `sed_modeling/` 下的源码和 [architecture.md](../architecture.md) 为准；文中提到的部分类名与文件路径可能已变化。
+
 ## 1. 目标
 
 这次重构把原来的单体 CRNN baseline 改成了统一的传统 SED 底座：

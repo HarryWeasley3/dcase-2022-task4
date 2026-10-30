@@ -1,5 +1,7 @@
 # CRNN + BEATs Residual Gated Fusion
 
+> **文档状态**：本文记录 2026-03 的设计阶段，保留作为工程决策的历史记录。当前实现见 `sed_modeling/modules/residual_gated_fusion.py` 与 [architecture.md](../architecture.md)。
+
 ## 1. 目标
 
 这一版不是 posterior fusion，也不是重新写一套训练框架，而是在当前已经跑通的 `CRNN + BEATs late fusion` 基础上，把：

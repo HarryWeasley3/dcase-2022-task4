@@ -1,0 +1,7 @@
+Model,Adopted source,Run/report path,Best checkpoint,Core files
+CRNN,report,baselines/CRNN-baseline/training_result_report.md,exp/2022_baseline/version_4/epoch=133-step=111756.ckpt,baselines/CRNN-baseline/training_result_report.md
+BEATs,exp,exp/unified_beats_synth_only_a800_finetune,exp/unified_beats_synth_only_a800_finetune/version_5/epoch=55-step=8791.ckpt,exp/unified_beats_synth_only_a800_finetune/metrics_test/student
+WavLM,exp,exp/WavLM_only,exp/WavLM_only/version_0/epoch=49-step=31249.ckpt,exp/WavLM_only/metrics_test/student
+CRNN + BEATs,exp,exp/crnn_beats_final,exp/crnn_beats_final/version_0/epoch=30-step=19374.ckpt,exp/crnn_beats_final/metrics_test/student
+CRNN + WavLM,exp,exp/crnn_wavlm_late_fusion_synth_only_fullft,exp/crnn_wavlm_late_fusion_synth_only_fullft/version_0/epoch=54-step=34374.ckpt,exp/crnn_wavlm_late_fusion_synth_only_fullft/metrics_test/student
+CRNN + BEATs + WavLM,exp,exp/cnn_beats_wavlm_full_unfreeze_late_fusion,exp/cnn_beats_wavlm_full_unfreeze_late_fusion/version_2/epoch=20-step=26249.ckpt,exp/cnn_beats_wavlm_full_unfreeze_late_fusion/metrics_test/student

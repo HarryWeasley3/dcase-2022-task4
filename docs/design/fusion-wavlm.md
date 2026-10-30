@@ -1,5 +1,7 @@
 # CRNN + WavLM Residual Gated Fusion
 
+> **文档状态**：本文记录 2026-03 的设计阶段，保留作为工程决策的历史记录。当前实现见 `sed_modeling/models/crnn_wavlm_residual_gated_fusion.py` 与 [architecture.md](../architecture.md)。
+
 ## 1. 目标
 
 这一版不是三路融合，也不是 posterior fusion，而是在当前已经跑通的 `CRNN + BEATs residual gated fusion` 基础上，做一个更严格、变量更受控的对照实验：
