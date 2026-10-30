@@ -3,7 +3,7 @@
 **Heterogeneous Self-Supervised Representation Fusion for Sound Event Detection**  
 DCASE 2022 Task 4 · DESED · PyTorch · MIT
 
-这是我本科毕业设计《异构自监督模型互补融合的声音事件检测研究》的代码。DCASE 2022 Task 4 的官方 baseline 把 Mel 前端、CNN、BiGRU 和两个预测头全部写死在一个 CRNN 类里，想换前端就得连训练流程一起改。我把它拆成「编码器 → 时间对齐 → 共享解码器」三层，接进 CRNN、BEATs、WavLM 三个编码器，再实现特征拼接、固定式中层融合和残差门控三种融合方式，让三种异构表征能在同一份数据、同一个标签栅格、同一套训练和评估流程下直接比较，回答"通用音频表征和语音域表征在声音事件检测里到底能不能互补"。
+这是我本科毕业设计《异构自监督模型互补融合的声音事件检测研究》的代码。DCASE 2022 Task 4 的官方 baseline 把 Mel 前端、CNN、BiGRU 和两个预测头全部写死在一个 CRNN 类里，想换前端就得连训练流程一起改。我把它拆成「编码器 → 时间对齐 → 共享解码器」三层，接进 CRNN、BEATs、WavLM 三个编码器，再比较特征拼接、固定式中层融合和残差门控三种融合方式，让三种异构表征能在同一份数据、同一个标签栅格、同一套训练和评估流程下直接比较，回答"通用音频表征和语音域表征在声音事件检测里到底能不能互补"。
 
 结论先说：CRNN+BEATs 是这套设定下最稳的参考，PSDS1 从 0.356 提到 0.522（+46.6%），Event-F1 从 43.42% 提到 58.64%（+15.22 个百分点）。加入 WavLM 之后，三分支的 Inter-F1 最高到 78.97%（比双分支高 4.61 个点），但 PSDS 和 Event-F1 都没能超过双分支。这个负结果本身是有信息量的：WavLM 补的是时间区间覆盖，不是完整事件检出，而且收益按类别给，BLE、ES 涨，CAT、DOG、SPE 跌。
 
@@ -39,7 +39,7 @@ python train_sed.py --conf_file confs/experiment_unified.yaml --gpus 1 \
     --test_from_checkpoint ./exp/<run>/version_0/<best>.ckpt
 ```
 
-想复现双分支那组，把 `model.branches.wavlm.enabled` 改成 `false` 就行，融合路由会自动切到 CRNN+BEATs 那条。数据按 `confs/experiment_unified.yaml` 里 `data.*` 的键准备 DESED 合成训练集与验证集；WavLM 权重、数据目录映射、显存不够时怎么冻结分支、几个常见报错，都写在 [docs/reproduction.md](docs/reproduction.md)。
+想跑双分支，把 `model.branches.wavlm.enabled` 改成 `false` 就行，融合路由会自动切到 CRNN+BEATs 的残差门控。数据按 `confs/experiment_unified.yaml` 里 `data.*` 的键准备 DESED 合成训练集与验证集；WavLM 权重、数据目录映射、显存不够时怎么冻结分支、几个常见报错，都写在 [docs/reproduction.md](docs/reproduction.md)。
 
 ## 实现
 
