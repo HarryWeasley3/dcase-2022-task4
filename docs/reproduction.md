@@ -2,7 +2,7 @@
 
 本文档说明如何在本仓库中准备环境、数据与预训练权重，并跑通训练和评估流程。它面向拿到仓库副本、希望重新训练或复现实验结果的读者，重点在"每一步实际要做什么、配置键对应什么、哪些东西仓库里没有"。模型的内部结构和三个编码器如何拼接请配合 [体系结构说明](architecture.md) 阅读，论文表格中的最终数字与逐类结果见 [实验结果](results.md)，本文只负责"怎么跑"。
 
-需要先说明仓库的现状：本仓库不包含任何训练好的模型权重，也不包含 `exp/` 训练输出目录、tensorboard 日志和预测 TSV；`confs/` 中保留的是配置定义，`docs/results/data/` 中保留的是整理后的结果表，它们都不是可以直接加载的权重。因此下面的流程描述的是文件和命令应当如何组织，它还没有在一台干净的机器上端到端验证过：安装依赖、下载数据、放置权重、启动训练这几步都跑通之前，不应把本文当作已验证的复现记录。凡是本文没有把握的地方都直接写"需要确认"，请按你环境里的实际报错处理。
+需要先说明仓库的现状：本仓库不包含训练好的模型权重（唯一的例外是 BEATs 全量微调权重，发布在 Releases 的 `beats-fullft-v1`），也不包含 `exp/` 训练输出目录、tensorboard 日志和预测 TSV；`confs/` 中保留的是配置定义，`docs/results/data/` 中保留的是整理后的结果表，它们都不是可以直接加载的权重。因此下面的流程描述的是文件和命令应当如何组织，它还没有在一台干净的机器上端到端验证过：安装依赖、下载数据、放置权重、启动训练这几步都跑通之前，不应把本文当作已验证的复现记录。凡是本文没有把握的地方都直接写"需要确认"，请按你环境里的实际报错处理。
 
 ## 1. 实验环境与依赖安装
 
@@ -108,18 +108,18 @@ python local/resample_folder.py \
 
 ### 3.1 权重清单与缺失时的行为
 
-仓库不提供任何权重文件，`.gitignore` 也排除了 `pretrained/`、`*.pt`、`*.ckpt` 等路径，因此完整复现需要在本地按下面的路径准备权重。主配置 [confs/experiment_unified.yaml](../confs/experiment_unified.yaml) 引用了六份权重，缺失时的行为并不相同：
+仓库不提供训练权重，`.gitignore` 也排除了 `pretrained/`、`*.pt`、`*.ckpt` 等路径（BEATs 全量微调权重例外，它发布在 Releases 里，不随仓库分发）。完整复现需要在本地按下面的路径准备权重。主配置 [confs/experiment_unified.yaml](../confs/experiment_unified.yaml) 引用了六份权重，缺失时的行为并不相同：
 
 | 文件（相对仓库根目录） | 配置键 | 来源 | 文件缺失时的行为 |
 | --- | --- | --- | --- |
 | `pretrained/beats/BEATs_iter3+_AS2M.pt` | `model.branches.beats.pretrained_checkpoint` | Microsoft BEATs 官方权重 | 构建模型时直接抛 `FileNotFoundError` |
-| `pretrained/beats/BEATs_full_finetune_best_0_78.pt` | `model.branches.beats.warmstart.checkpoint` | 本项目的 BEATs 全量微调产物 | `warmstart.enable` 为 true 时抛 `FileNotFoundError` |
+| `pretrained/beats/BEATs_full_finetune_best_0_78.pt` | `model.branches.beats.warmstart.checkpoint` | 本项目的 BEATs 全量微调产物，已发布在 Releases 的 [`beats-fullft-v1`](https://github.com/HarryWeasley3/dcase-2022-task4/releases/tag/beats-fullft-v1) | `warmstart.enable` 为 true 时抛 `FileNotFoundError` |
 | `pretrained/wavlm/WavLM-Base+.pt` | `model.branches.wavlm.pretrained_checkpoint` | torchaudio WavLM bundle，或 torchaudio 兼容的 state dict | 文件不存在且 `use_bundle_weights` 为 true 时回退到 torchaudio bundle |
 | `pretrained/wavlm/WavLM_full_finetune_best_0_65.pt` | `model.branches.wavlm.warmstart.checkpoint` | 本项目的 WavLM 全量微调产物，可用 `scripts/extract_wavlm_ckpt.py` 导出 | 打印 `checkpoint not found ... skipping` 后继续 |
 | `pretrained/crnn/crnn_best.pt` | `model.branches.crnn.warmstart.checkpoint` | 纯 CRNN 实验的 best checkpoint（旧版 CRNN 权重格式，见 3.3） | 打印 `checkpoint not found ... skipping` 后继续 |
 | `exp/unified_beats_synth_only_a800_finetune/version_5/epoch=55-step=8791.ckpt` | `model.decoder_warmstart.checkpoint` | 论文 BEATs 全量微调实验的 best checkpoint | 打印 `checkpoint not found ... skipping` 后继续 |
 
-表中的"抛 `FileNotFoundError`"和"打印 skipping"都来自 `sed_modeling/encoders/beats_encoder.py` 与 `sed_modeling/models/sed_model.py` 的现有加载逻辑。对 Stage-A 主实验而言，前两项是硬依赖，后四项缺失只会让对应分支从随机初始化或 torchaudio 自带权重开始，不会阻止训练启动，但会改变与论文实验的初始化一致性。
+表中的"抛 `FileNotFoundError`"和"打印 skipping"都来自 `sed_modeling/encoders/beats_encoder.py` 与 `sed_modeling/models/sed_model.py` 的现有加载逻辑。对默认配置而言，前两项是硬依赖，后四项缺失只会让对应分支从随机初始化或 torchaudio 自带权重开始，不会阻止训练启动，但会改变与论文实验的初始化一致性。
 
 ### 3.2 BEATs 与 WavLM 预训练权重
 
@@ -129,21 +129,27 @@ WavLM 分支的代码路径支持两种来源：`pretrained_checkpoint` 指向�
 
 ### 3.3 项目内 warm-start 权重的准备
 
-`BEATs_full_finetune_best_0_78.pt` 与 `WavLM_full_finetune_best_0_65.pt` 是论文多阶段训练的中间产物，当前仓库的 `confs/` 中没有保留生成它们的单分支训练配置，`exp/` 目录也没有随仓库发布，因此要完整复现这两个权重，需要先按单分支方式训练对应的 BEATs-only / WavLM-only 模型，再用脚本导出：
+`BEATs_full_finetune_best_0_78.pt` 已经发布在 Releases 的 [`beats-fullft-v1`](https://github.com/HarryWeasley3/dcase-2022-task4/releases/tag/beats-fullft-v1)：下载后按原文件名放进 `pretrained/beats/` 即可，配置里的 `model.branches.beats.warmstart.checkpoint` 正好指向这个路径。文件约 345 MB，sha256 为 `dff86d366a70079d7e94d2da787d9d216a4cf2a418d666a25fc79c2172432fec`；它是 `scripts/extract_ckpt.py` 把全量微调的 BEATs 编码器权重合并回官方文件后得到的格式，`BEATsEncoder` 可以直接加载。
+
+`WavLM_full_finetune_best_0_65.pt` 还没有发布，是论文多阶段训练的中间产物，当前仓库的 `confs/` 中没有保留生成它的单分支训练配置，`exp/` 目录也没有随仓库发布，因此要复现这个权重，需要先按单分支方式训练 WavLM-only 模型，再用脚本导出：
+
+```bash
+# 从 WavLM-only 训练产出的 checkpoint 中导出 WavLM 权重
+python scripts/extract_wavlm_ckpt.py --src /path/to/wavlm_only_run/epoch=xxx-step=xxxxx.ckpt --out pretrained/wavlm/WavLM_full_finetune_best_0_65.pt
+```
+
+如果要自己重新生成 BEATs warm-start 权重，对应命令是：
 
 ```bash
 # 从 BEATs-only 训练产出的 Lightning checkpoint 中合并出 BEATs warm-start 权重
 python scripts/extract_ckpt.py --src /path/to/beats_only_run/epoch=xxx-step=xxxxx.ckpt --base pretrained/beats/BEATs_iter3+_AS2M.pt --out pretrained/beats/BEATs_full_finetune_best_0_78.pt
-
-# 从 WavLM-only 训练产出的 checkpoint 中导出 WavLM 权重
-python scripts/extract_wavlm_ckpt.py --src /path/to/wavlm_only_run/epoch=xxx-step=xxxxx.ckpt --out pretrained/wavlm/WavLM_full_finetune_best_0_65.pt
 ```
 
 这两个脚本只负责从训练 checkpoint 里抽取编码器权重（BEATs 脚本还会把权重合并回官方文件的 `model` 键），它们不负责训练模型；训练单分支模型所需的配置、轮数和随机种子是否与论文完全一致，需要确认。`crnn_best.pt` 的情况更麻烦一些：当前 `build_sed_model` 统一走 encoder-decoder 结构，用 `confs/default.yaml` 训练出的 CRNN checkpoint 里编码器键是 `sed_student.encoder.cnn.*` 形式，而 `_load_crnn_encoder_warmstart` 只识别 `crnn_encoder.cnn.`、`sed_student.cnn.`、`cnn.` 这三种旧版 CRNN 权重前缀，两者并不匹配。因此用当前代码重新训练 CRNN 后不能直接把 checkpoint 改名成 `crnn_best.pt` 当 warm-start 用，需要自行做 key 重映射导出（仓库没有现成的转换脚本，这一步需要自行处理），或者使用旧版 CRNN 实验留下的 checkpoint。
 
 ## 4. 冒烟测试
 
-`--fast_dev_run` 会在训练脚本层面把每套数据限制为 2 个 batch、最多 3 个 epoch，并把日志频率调成每步一次，用于检查数据管线、模型构建和日志记录是否正常。它仍然会完整构建模型、读取配置里的权重路径，因此必须是合成数据、BEATs 官方权重和 BEATs warm-start 权重都已就位才能跑 Stage-A 配置：
+`--fast_dev_run` 会在训练脚本层面把每套数据限制为 2 个 batch、最多 3 个 epoch，并把日志频率调成每步一次，用于检查数据管线、模型构建和日志记录是否正常。它仍然会完整构建模型、读取配置里的权重路径，因此必须是合成数据、BEATs 官方权重和 BEATs warm-start 权重都已就位才能按默认配置跑起来：
 
 ```bash
 python train_sed.py \
@@ -161,23 +167,23 @@ python train_sed.py \
 
 ### 5.1 配置结构与 profile
 
-`train_sed.py` 用 `--conf_file` 读取 YAML，并在加载时解析 `profile`：文件顶层的 `profile` 字段从同文件的 `profiles` 字典中选出一组覆盖项，与基础配置做深度合并。主配置 `confs/experiment_unified.yaml` 的默认 profile 是 `hierarchical_ssl_stage_a`，它把 `model.fusion.strategy` 覆盖为 `hierarchical_ssl`，因此按原文件训练得到的是 CRNN + BEATs + WavLM 的层级 SSL 融合模型；同一个文件里还有一个 `server_a800` profile，它只覆盖训练相关的数值，不覆盖融合策略，所以把顶层 `profile` 改成 `server_a800` 时会退回基础的 `residual_gated` 三路残差门控融合。仓库没有提供选择 profile 的命令行参数，切换需要直接编辑 YAML 顶部的 `profile` 值。
+`train_sed.py` 用 `--conf_file` 读取 YAML，并在加载时解析 `profile`：文件顶层的 `profile` 字段从同文件的 `profiles` 字典中选出一组覆盖项，与基础配置做深度合并。主配置 `confs/experiment_unified.yaml` 的默认 profile 是 `rtx_5090`，它只覆盖训练相关的数值，不覆盖融合策略，因此按原文件训练得到的是基础的 `residual_gated` 三路残差门控融合，也就是论文实验用的那条配置，单卡 5090 就能跑；同一个文件里还有一个 `hierarchical_ssl_stage_a` profile，它把 `model.fusion.strategy` 覆盖为 `hierarchical_ssl`，训练的是 CRNN + BEATs + WavLM 的层级 SSL 融合模型（论文之后的扩展）。仓库没有提供选择 profile 的命令行参数，切换需要直接编辑 YAML 顶部的 `profile` 值。
 
-另外还有一份独立的 [confs/experiment_resgate_beats_anchor_topk.yaml](../confs/experiment_resgate_beats_anchor_topk.yaml)，它是残差门控 + BEATs 时间锚点 + 分组学习率 + top-k checkpoint 保存的配置变体，`training.synth_only` 同样为 true，可用于对照实验，不改变本文的 Stage-A 主流程。
+另外还有一份独立的 [confs/experiment_resgate_beats_anchor_topk.yaml](../confs/experiment_resgate_beats_anchor_topk.yaml)，它是残差门控 + BEATs 时间锚点 + 分组学习率 + top-k checkpoint 保存的配置变体，`training.synth_only` 同样为 true，可用于对照实验，与默认配置互不影响。
 
 ### 5.2 训练命令与关键超参
 
-Stage-A 主实验的训练命令如下（配置里 `training.synth_only` 已经是 true，`--synth_only` 只是显式重申，二者等价）：
+默认配置（`profile: rtx_5090`）的训练命令如下（配置里 `training.synth_only` 已经是 true，`--synth_only` 只是显式重申，二者等价）：
 
 ```bash
 python train_sed.py \
   --conf_file confs/experiment_unified.yaml \
-  --log_dir ./exp/unified_hierarchical_ssl_stage_a \
+  --log_dir ./exp/unified_resgate_rtx5090 \
   --gpus 1 \
   --synth_only
 ```
 
-当前主配置的训练设定是：`n_epochs: 120`、`n_epochs_warmup: 10`、`batch_size: 8`、`batch_size_val: 8`、`num_workers: 4`、`accumulate_batches: 1`、`precision: 32`、`gradient_clip: 1.0`、`early_stop_patience: 20`、`median_window: 7`、`val_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]`、`n_test_thresholds: 50`、`ema_factor: 0.999`、`self_sup_loss: mse`、`mixup: soft`、`seed: 42`；优化器是 Adam，基础学习率 `1.5e-5`，调度器为 `warmup_cosine`（`min_lr: 1e-6`、`decay_power: 0.6`）。主配置的 `opt.param_groups` 没有开启，三路分支共享同一个学习率；需要分组学习率时使用 5.1 节提到的那份残差门控配置。模型侧，`model.branches` 同时启用 crnn、beats、wavlm 三个分支，BEATs 与 WavLM 的 `freeze` 都是 false（全量微调），层级融合取 BEATs/WavLM 的第 5、11 层，`fuse_dim: 256`，门控为 channel 模式；具体结构参见 [体系结构说明](architecture.md)。
+当前主配置的训练设定是：`n_epochs: 120`、`n_epochs_warmup: 10`、`batch_size: 8`、`batch_size_val: 8`、`num_workers: 4`、`accumulate_batches: 1`、`precision: 32`、`gradient_clip: 1.0`、`early_stop_patience: 20`、`median_window: 7`、`val_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7]`、`n_test_thresholds: 50`、`ema_factor: 0.999`、`self_sup_loss: mse`、`mixup: soft`、`seed: 42`；优化器是 Adam，基础学习率 `1.5e-5`，调度器为 `warmup_cosine`（`min_lr: 1e-6`、`decay_power: 0.6`）。主配置的 `opt.param_groups` 没有开启，三路分支共享同一个学习率；需要分组学习率时使用 5.1 节提到的那份残差门控配置。模型侧，`model.branches` 同时启用 crnn、beats、wavlm 三个分支，BEATs 与 WavLM 的 `freeze` 都是 false（全量微调），融合策略是 `residual_gated`（`fusion_type: beats_main_residual_gated`，以 BEATs 为主路径），`fuse_dim: 256`、门控为 channel 模式、α 可学习；层级融合的 `beats_layers` / `wavlm_layers` 等参数只在 `hierarchical_ssl_stage_a` profile 下生效。具体结构参见 [体系结构说明](architecture.md)。
 
 `--gpus` 的语义按代码实现：在 Lightning 2.x 路径下，字符串 `"0"` 表示 CPU，其余任何值都按单卡 GPU 处理并固定 `devices=1`，不解析卡号；如果要指定具体显卡，需要用 `CUDA_VISIBLE_DEVICES` 控制可见设备（这一点是从源码直接推断的，实际行为需要确认）。多卡不受支持：`--gpus "1,2"` 会直接抛 `NotImplementedError`。当 `synth_only` 生效时，同时传入 `--strong_real` 只会得到一条被忽略的警告。
 
@@ -251,4 +257,4 @@ python train_sed.py \
 
 仓库根目录的 [LICENSE](../LICENSE) 是标准 MIT 全文，Copyright (c) 2026 李想 (Li Xiang)。仓库中的 `desed_task/` 源自 DCASE 官方仓库 `DCASE-REPO/DESED_task` 的 DCASE 2022 Task 4 baseline（上游同样以 MIT 发布），保留该目录时请同时保留其归属说明；`sed_modeling/third_party/beats/` 是 Microsoft BEATs 官方代码的最小化 vendored 版本，其许可证单独放在 [sed_modeling/third_party/beats/LICENSE](../sed_modeling/third_party/beats/LICENSE)，Copyright (c) 2022 Microsoft，来源是 `microsoft/unilm` 的 `beats` 目录。DESED 数据集、AudioSet 数据、BEATs 与 WavLM 预训练权重的使用还受各自发布方条款约束，论文和商业使用前需要核对具体许可；这些内容不在本仓库 MIT 的覆盖范围内。
 
-最后再强调一次：仓库不包含训练权重，也不包含 `exp/` 结果目录、tensorboard 日志和预测文件，本文中的流程尚未在干净环境中端到端验证。当前可以确认的是代码和配置的静态结构（argparse 参数、配置键、加载逻辑、缺失时的提示行为都已按源码核对）；以下事项需要在真实环境中确认：论文所用各库的精确版本（尤其 pytorch-lightning、torchmetrics、scipy、codecarbon）、BEATs/WavLM 官版权重的具体下载方式与 WavLM-Base+.pt 的格式、单分支 warm-start 权重的训练配置与导出结果、decoder warm-start checkpoint 是否参与论文主实验，以及论文表格中的数字是否能由当前 `confs/experiment_unified.yaml` 精确复现。论文口径的结果数据请以 [实验结果](results.md) 和 [实验映射表](results/data/experiment_mapping_table.csv) 为准；架构细节请以 [体系结构说明](architecture.md) 为准。
+最后再强调一次：仓库不包含训练权重（BEATs 全量微调权重在 Releases 里单独发布），也不包含 `exp/` 结果目录、tensorboard 日志和预测文件，本文中的流程尚未在干净环境中端到端验证。当前可以确认的是代码和配置的静态结构（argparse 参数、配置键、加载逻辑、缺失时的提示行为都已按源码核对）；以下事项需要在真实环境中确认：论文所用各库的精确版本（尤其 pytorch-lightning、torchmetrics、scipy、codecarbon）、BEATs/WavLM 官版权重的具体下载方式与 WavLM-Base+.pt 的格式、单分支 warm-start 权重的训练配置与导出结果、decoder warm-start checkpoint 是否参与论文主实验，以及论文表格中的数字是否能由当前 `confs/experiment_unified.yaml` 精确复现。论文口径的结果数据请以 [实验结果](results.md) 和 [实验映射表](results/data/experiment_mapping_table.csv) 为准；架构细节请以 [体系结构说明](architecture.md) 为准。

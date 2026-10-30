@@ -1,7 +1,7 @@
-profile: hierarchical_ssl_stage_a
+profile: rtx_5090
 
 profiles:
-  server_a800:
+  rtx_5090:
     training:
       batch_size: 8
       batch_size_val: 8

@@ -84,13 +84,7 @@ late 融合先把各路特征对齐到同一时间栅格，再沿特征维拼接
 
 ### 5.2 残差门控融合
 
-残差门控是这篇工作里最核心的设计。它不把两路特征对称地拼在一起，而是明确指定 BEATs 为主路径、CRNN 为修正分支，让新增信息以门控残差的形式叠加：
-
-$$
-\text{fused} = \text{beats\_norm} + \alpha \cdot \text{gate} \cdot \text{cnn\_norm}
-$$
-
-其中 `gate = sigmoid(gate_net([cnn_norm, beats_norm]))`。为了让两条来自不同表征空间的支路可比，两路特征先各自经过独立线性投影（`cnn_proj` / `beats_proj`）与分支 LayerNorm（`cnn_norm` / `beats_norm`），再拼接送入门控网络。门控网络的最后一层偏置初始化为 `-1.5`，于是训练初期 gate ≈ 0.18，模型基本等价于强分支本身，只有训练证明修正有效时门控才会打开；`use_alpha_scale=True` 时 α 也是可学习参数，否则是一个固定 buffer。门控有两种粒度：`gate_mode: channel` 输出与特征维同长的通道级权重，`gate_mode: frame` 只输出一个标量、由广播作用在时间维上。融合后的特征还可以经过一次 `post_fusion_proj`（Linear + LayerNorm + Dropout）再送进解码器。
+残差门控是这篇工作里最核心的设计。它不把两路特征对称地拼在一起，而是明确指定 BEATs 为主路径、CRNN 为修正分支，让新增信息以门控残差的形式叠加：`fused = beats_norm + α · gate · cnn_norm`，其中 `gate = sigmoid(gate_net([cnn_norm, beats_norm]))`。为了让两条来自不同表征空间的支路可比，两路特征先各自经过独立线性投影（`cnn_proj` / `beats_proj`）与分支 LayerNorm（`cnn_norm` / `beats_norm`），再拼接送入门控网络。门控网络的最后一层偏置初始化为 `-1.5`，于是训练初期 gate ≈ 0.18，模型基本等价于强分支本身，只有训练证明修正有效时门控才会打开；`use_alpha_scale=True` 时 α 也是可学习参数，否则是一个固定 buffer。门控有两种粒度：`gate_mode: channel` 输出与特征维同长的通道级权重，`gate_mode: frame` 只输出一个标量、由广播作用在时间维上。融合后的特征还可以经过一次 `post_fusion_proj`（Linear + LayerNorm + Dropout）再送进解码器。
 
 ![残差门控融合结构](figures/fusion-residual-gated.png)
 
@@ -139,7 +133,7 @@ $$
 
 | 配置键 | 取值 | 作用 |
 |---|---|---|
-| `profile` | `server_a800` / `hierarchical_ssl_stage_a` | 选择参数覆盖组；后者把融合切到层级 SSL 路由 |
+| `profile` | `rtx_5090` / `hierarchical_ssl_stage_a` | 选择参数覆盖组；前者是单卡 5090 的论文实验配置（残差门控三分支），后者把融合切到层级 SSL 路由 |
 | `model.branches.crnn.enabled` | true / false | 是否启用 CRNN 分支 |
 | `model.branches.beats.enabled` | true / false | 是否启用 BEATs 分支 |
 | `model.branches.wavlm.enabled` | true / false | 是否启用 WavLM 分支 |
